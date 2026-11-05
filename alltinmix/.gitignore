@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.env
+*.log
+backend/uploads/
+.DS_Store
+frontend/.env.app
+frontend/android/app/build/
+frontend/android/.gradle/
+frontend/android/local.properties
+frontend/ios/App/Pods/
+frontend/ios/App/build/
+*.keystore
+*.jks

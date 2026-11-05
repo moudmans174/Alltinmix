@@ -1,0 +1,35 @@
+{
+  "name": "alltinmix-backend",
+  "version": "2.0.0",
+  "private": true,
+  "description": "ALLTINMIX marketplace API: products, services, real estate, vehicles. PostgreSQL, pluggable payments, escrow, messaging.",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "migrate": "node src/cli.js migrate",
+    "create-admin": "node src/cli.js create-admin",
+    "test": "node --test --test-concurrency=1 test/api.test.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^5.1.0",
+    "express-rate-limit": "^7.4.0",
+    "helmet": "^8.0.0",
+    "jsonwebtoken": "^9.0.2",
+    "morgan": "^1.10.0",
+    "multer": "^2.0.0",
+    "nodemailer": "^10.3.1",
+    "pg": "^8.12.0",
+    "stripe": "^17.0.0",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "supertest": "^7.0.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
