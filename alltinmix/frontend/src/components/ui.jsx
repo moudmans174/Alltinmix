@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { Link, Navigate, useLocation } from 'react-router-dom';
-import { ChevronLeft, ChevronRight, ImageOff } from 'lucide-react';
-import { useAuth, useConfig } from '../context';
+import { ChevronLeft, ChevronRight, ImageOff, ShieldCheck } from 'lucide-react';
+import { useAuth, useConfig, useTheme } from '../context';
 import { assetUrl } from '../api';
 
 export const Spinner = () => <div className="spinner" aria-label="Loading" />;
@@ -76,7 +76,10 @@ export function Protected({ roles, children }) {
 
 export function ImageGallery({ images, alt }) {
   const [i, setI] = useState(0);
+  const [show, setShow] = useState(false);
+  const { lowData } = useTheme();
   if (!images?.length) return <div className="gallery-empty"><ImageOff size={36} /><span>No photos yet</span></div>;
+  if (lowData && !show) return <div className="gallery-empty"><ImageOff size={36} /><span>Low-data mode: {images.length} photo{images.length > 1 ? 's' : ''} hidden</span><button className="btn btn-ghost btn-sm" onClick={() => setShow(true)}>Show photos</button></div>;
   return (
     <div className="gallery">
       <img className="gallery-main" src={assetUrl(images[i])} alt={alt} />
@@ -129,3 +132,8 @@ export function attributeSummary(listing, vertical, max = 4) {
 }
 
 export const LinkButton = ({ to, children, ...rest }) => <Link to={to} className="btn btn-primary" {...rest}>{children}</Link>;
+
+/** Small green tick shown next to sellers whose ID was checked by the marketplace. */
+export function VerifiedBadge({ label = true }) {
+  return <span className="verified-badge" title="This seller's ID was checked by us"><ShieldCheck size={14} />{label && ' Verified'}</span>;
+}

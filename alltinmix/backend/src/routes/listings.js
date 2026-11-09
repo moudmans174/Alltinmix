@@ -39,13 +39,16 @@ function toApi(r, { priv = false } = {}) {
     ratingAvg: Number(r.rating_avg),
     ratingCount: r.rating_count,
     soldCount: r.sold_count,
+    sellerVerified: !!r.seller_verified,
+    promoted: !!(r.promoted_until && new Date(r.promoted_until) > new Date()),
+    ...(priv ? { views: r.views, promotedUntil: r.promoted_until } : {}),
     createdAt: r.created_at,
     // The digital delivery link is private to the seller until a buyer pays.
     ...(priv ? { deliveryUrl: r.delivery_url } : {}),
   };
 }
 
-const SELECT = `SELECT l.*, u.name AS seller_name, u.tag AS seller_tag FROM listings l JOIN users u ON u.id = l.seller_id`;
+const SELECT = `SELECT l.*, u.name AS seller_name, u.tag AS seller_tag, (u.verification_status = 'approved') AS seller_verified FROM listings l JOIN users u ON u.id = l.seller_id`;
 
 // ------------------------------------------------------------ validation
 
@@ -112,9 +115,11 @@ router.get('/', optionalAuth, async (req, res) => {
   if (q.location) add('l.location ILIKE ?', `%${String(q.location).slice(0, 80)}%`);
   if (q.minPrice && Number.isFinite(Number(q.minPrice))) add('l.price_minor >= ?', toMinor(q.minPrice));
   if (q.maxPrice && Number.isFinite(Number(q.maxPrice))) add('l.price_minor <= ?', toMinor(q.maxPrice));
+  if (q.verified === '1') add("u.verification_status = 'approved' AND ?::int = 1", 1);
   if (q.seller) add('l.seller_id = ?', String(q.seller));
   if (req.user) add('l.seller_id NOT IN (SELECT blocked_id FROM blocks WHERE blocker_id = ?)', req.user.id);
-  const order = { price_asc: 'l.price_minor ASC', price_desc: 'l.price_minor DESC', rating: 'l.rating_avg DESC, l.rating_count DESC', popular: 'l.sold_count DESC' }[q.sort] || 'l.created_at DESC';
+  const boosted = q.sort ? '' : '(l.promoted_until IS NOT NULL AND l.promoted_until > now()) DESC, ';
+  const order = boosted + ({ price_asc: 'l.price_minor ASC', price_desc: 'l.price_minor DESC', rating: 'l.rating_avg DESC, l.rating_count DESC', popular: 'l.sold_count DESC' }[q.sort] || 'l.created_at DESC');
   const { limit, page, offset } = paging(q, { defaultLimit: 24, max: 48 });
   const sqlWhere = where.join(' AND ');
   const [{ rows }, { rows: total }] = await Promise.all([
@@ -135,21 +140,26 @@ router.get('/:id', optionalAuth, async (req, res) => {
   const l = rows[0];
   const isOwner = l && req.user && (req.user.id === l.seller_id || req.user.role === 'admin');
   if (!l || l.status === 'deleted' || (l.status !== 'active' && !isOwner)) throw new HttpError(404, 'Listing not found.');
+  if (!isOwner && l.status === 'active') db.query('UPDATE listings SET views = views + 1 WHERE id = $1', [l.id]).catch(() => {});
   const { rows: reviews } = await db.query(
-    'SELECT r.rating, r.comment, r.created_at, u.name AS reviewer FROM reviews r JOIN users u ON u.id = r.reviewer_id WHERE r.listing_id = $1 ORDER BY r.created_at DESC LIMIT 10',
+    'SELECT r.rating, r.comment, r.images, r.created_at, u.name AS reviewer FROM reviews r JOIN users u ON u.id = r.reviewer_id WHERE r.listing_id = $1 ORDER BY r.created_at DESC LIMIT 10',
     [l.id]
   );
-  res.json({ listing: toApi(l, { priv: isOwner }), reviews: reviews.map((r) => ({ rating: r.rating, comment: r.comment, reviewer: r.reviewer, createdAt: r.created_at })) });
+  res.json({ listing: toApi(l, { priv: isOwner }), reviews: reviews.map((r) => ({ rating: r.rating, comment: r.comment, reviewer: r.reviewer, images: r.images, createdAt: r.created_at })) });
 });
 
-router.post('/', requireAuth, requireRole('seller', 'admin'), requireVerified, async (req, res) => {
-  const data = toColumns(parse(listingSchema, req.body));
+async function insertListing(sellerId, data) {
   const { rows } = await db.query(
     `INSERT INTO listings (seller_id, type, category, title, description, price_minor, currency, location, attributes, images, delivery_days, fulfillment, stock, shipping_days, delivery_url)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING id`,
-    [req.user.id, data.type, data.category, data.title, data.description, data.price_minor, config.marketplace.currency.code, data.location, JSON.stringify(data.attributes), JSON.stringify(data.images), data.delivery_days, data.fulfillment, data.stock, data.shipping_days, data.delivery_url]
+    [sellerId, data.type, data.category, data.title, data.description, data.price_minor, config.marketplace.currency.code, data.location, JSON.stringify(data.attributes), JSON.stringify(data.images), data.delivery_days, data.fulfillment, data.stock, data.shipping_days, data.delivery_url]
   );
-  const full = await db.query(`${SELECT} WHERE l.id = $1`, [rows[0].id]);
+  return rows[0].id;
+}
+
+router.post('/', requireAuth, requireRole('seller', 'admin'), requireVerified, async (req, res) => {
+  const id = await insertListing(req.user.id, toColumns(parse(listingSchema, req.body)));
+  const full = await db.query(`${SELECT} WHERE l.id = $1`, [id]);
   res.status(201).json({ listing: toApi(full.rows[0], { priv: true }) });
 });
 
@@ -221,7 +231,7 @@ function looksLikeImage(file) {
   return false;
 }
 
-uploads.post('/', requireAuth, requireRole('seller', 'admin'), upload.array('images', config.marketplace.limits.maxImagesPerListing), (req, res) => {
+function handleUpload(req, res) {
   const files = req.files || [];
   if (!files.length) throw new HttpError(400, 'Choose at least one image.', { code: 'BAD_FILE' });
   const urls = [];
@@ -233,6 +243,9 @@ uploads.post('/', requireAuth, requireRole('seller', 'admin'), upload.array('ima
     urls.push('/uploads/' + f.filename);
   }
   res.status(201).json({ urls });
-});
+}
+uploads.post('/', requireAuth, requireRole('seller', 'admin'), upload.array('images', config.marketplace.limits.maxImagesPerListing), handleUpload);
+// Buyers can attach up to 3 photos to a review.
+uploads.post('/review', requireAuth, requireVerified, upload.array('images', 3), handleUpload);
 
-module.exports = { listings: router, uploads };
+module.exports = { listings: router, uploads, toApi, SELECT, IMAGE_RE, insertListing, listingSchema, toColumns };

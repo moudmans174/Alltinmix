@@ -2,7 +2,9 @@ const config = require('./config');
 const db = require('./db');
 const { createApp } = require('./app');
 const { processOutbox } = require('./lib/notify');
+const { processSmsOutbox } = require('./lib/sms');
 const orders = require('./services/orders');
+const { expireOffers } = require('./routes/buyer');
 
 async function main() {
   if (config.autoMigrate) {
@@ -17,7 +19,9 @@ async function main() {
   const safe = (name, fn) => () => fn().catch((err) => console.error(`[job:${name}]`, err.message));
   const timers = [
     setInterval(safe('emails', () => processOutbox()), 10_000),
+    setInterval(safe('sms', () => processSmsOutbox()), 10_000),
     setInterval(safe('expire-payments', () => orders.expireStalePayments()), 60_000),
+    setInterval(safe('offers', expireOffers), 10 * 60_000),
     setInterval(safe('auto-complete', () => orders.autoCompleteDelivered()), 10 * 60_000),
   ];
 

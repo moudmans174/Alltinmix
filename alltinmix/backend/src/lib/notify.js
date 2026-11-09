@@ -2,6 +2,7 @@ const nodemailer = require('nodemailer');
 const config = require('../config');
 const db = require('../db');
 const { escapeHtml } = require('./util');
+const { enqueueSms } = require('./sms');
 
 let transport; // undefined = not created yet, null = SMTP not configured
 function getTransport() {
@@ -74,8 +75,12 @@ async function processOutbox(limit = 20) {
  * `q` is a pg client (inside a transaction) or the db module, so a notification is only
  * saved if the action that caused it actually committed.
  */
-async function notify(q, { userId, type, title, body = '', link = null, email = false }) {
+async function notify(q, { userId, type, title, body = '', link = null, email = false, sms = false }) {
   await q.query('INSERT INTO notifications (user_id, type, title, body, link) VALUES ($1,$2,$3,$4,$5)', [userId, type, title, body, link]);
+  if (sms) {
+    const { rows } = await q.query('SELECT phone FROM users WHERE id = $1', [userId]);
+    if (rows[0]?.phone) await enqueueSms(q, { phone: rows[0].phone, body: `${config.marketplace.brand.name}: ${title}. ${body}`.trim() });
+  }
   if (email) {
     const { rows } = await q.query('SELECT email FROM users WHERE id = $1', [userId]);
     if (rows[0]) {

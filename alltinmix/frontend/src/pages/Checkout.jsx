@@ -2,33 +2,48 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { Trash2 } from 'lucide-react';
 import { api, assetUrl } from '../api';
-import { useAuth, useCart, useConfig, useToast } from '../context';
+import { useAuth, useCart, useConfig, useTheme, useToast } from '../context';
 import { openPayment } from '../native';
 import { Alert, Empty, Field, Receipt, Spinner } from '../components/ui';
 
 export function Cart() {
   const { items, setQty, remove, clear } = useCart();
-  const { formatIn, convert, currencies, rates, baseCode, displayCurrency, paymentMethods, brand } = useConfig();
+  const toast = useToast();
+  const { lowData } = useTheme();
+  const { formatIn, convert, currencies, rates, baseCode, displayCurrency, paymentMethods, brand, delivery: deliveryCfg } = useConfig();
   const { user } = useAuth();
   const nav = useNavigate();
   // The buyer picks the currency to pay in; only payment methods that accept that currency are listed.
   const available = [...new Set(paymentMethods.flatMap((m) => m.currencies))];
   const payOptions = currencies.filter((c) => available.includes(c.code));
   const [payCode, setPayCode] = useState(payOptions.find((c) => c.code === displayCurrency.code)?.code || payOptions[0]?.code || baseCode);
-  const methods = paymentMethods.filter((m) => m.currencies.includes(payCode));
+  const physical = items.filter((i) => i.listing.fulfillment === 'physical');
+  const allPhysical = items.length > 0 && physical.length === items.length;
+  const zones = deliveryCfg?.zones || [];
+  const [dv, setDv] = useState({ method: 'ship', zone: '', name: user?.name || '', phone: user?.phone || '', address: '', note: '' });
+  const setD = (k) => (e) => setDv((d) => ({ ...d, [k]: e.target.value }));
+  const sellerCount = new Set(physical.map((i) => i.listing.sellerId || i.listing.sellerName)).size;
+  const zone = zones.find((z) => z.name === dv.zone);
+  const feeBase = physical.length && dv.method === 'ship' && zone ? zone.feeMinor * sellerCount : 0;
+  // Cash on delivery only makes sense when everything in the cart is a physical item.
+  const methods = paymentMethods.filter((m) => m.currencies.includes(payCode) && (m.kind !== 'cod' || allPhysical));
   const [method, setMethod] = useState(methods[0]?.key || '');
   useEffect(() => { if (!methods.some((m) => m.key === method)) setMethod(methods[0]?.key || ''); }, [payCode]); // eslint-disable-line react-hooks/exhaustive-deps
   const pay = (baseMinor) => formatIn(convert(baseMinor, payCode), payCode);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const [coupon, setCoupon] = useState('');
 
-  const total = items.reduce((s, i) => s + i.listing.priceMinor * i.qty, 0);
+  const total = items.reduce((s, i) => s + i.listing.priceMinor * i.qty, 0) + feeBase;
 
   const checkout = async () => {
     setBusy(true); setError('');
     try {
-      const d = await api.post('/orders/checkout', { items: items.map((i) => ({ listingId: i.listingId, qty: i.qty })), method, currency: payCode });
+      const body = { items: items.map((i) => ({ listingId: i.listingId, qty: i.qty, ...(i.offerId ? { offerId: i.offerId } : {}) })), method, currency: payCode, ...(coupon.trim() ? { couponCode: coupon.trim() } : {}) };
+      if (physical.length) body.delivery = dv.method === 'pickup' ? { method: 'pickup', name: dv.name, phone: dv.phone, note: dv.note } : { ...dv, zone: dv.zone || undefined };
+      const d = await api.post('/orders/checkout', body);
       clear();
+      if (d.kind === 'cod') { toast('Order placed. Pay in cash when it arrives.'); nav('/orders'); return; }
       if (/^https?:\/\//.test(d.redirectUrl)) { // card / PayPal hosted page (an in-app browser inside the phone app)
         await openPayment(d.redirectUrl, () => nav(`/pay/return/${d.paymentId}`));
         setBusy(false);
@@ -48,11 +63,11 @@ export function Cart() {
       <div className="detail" style={{ gridTemplateColumns: '1.4fr 1fr' }}>
         <div className="card">
           {items.map(({ listingId, qty, listing }) => {
-            const single = listing.type === 'service' || listing.fulfillment === 'digital';
+            const single = listing.type === 'service' || listing.fulfillment === 'digital' || !!listing.offerId;
             return (
               <div className="cart-line" key={listingId}>
-                {listing.image ? <img src={assetUrl(listing.image)} alt="" /> : <div className="ph" />}
-                <div><Link to={`/listing/${listingId}`}><b>{listing.title}</b></Link><div className="muted small">{listing.sellerName} · {pay(listing.priceMinor)} each</div>
+                {listing.image && !lowData ? <img src={assetUrl(listing.image)} alt="" /> : <div className="ph" />}
+                <div><Link to={`/listing/${listingId}`}><b>{listing.title}</b></Link><div className="muted small">{listing.sellerName} · {pay(listing.priceMinor)} each{listing.offerId && <span className="pill pill-green" style={{ marginLeft: 6 }}>Agreed price × {qty}</span>}</div>
                   {!single && <div className="qty" style={{ marginTop: 6 }}><button onClick={() => setQty(listingId, qty - 1)} aria-label="Less">−</button><span>{qty}</span><button onClick={() => setQty(listingId, qty + 1)} aria-label="More">+</button></div>}
                 </div>
                 <div className="right"><b>{pay(listing.priceMinor * qty)}</b><br /><button className="link-btn small" onClick={() => remove(listingId)} aria-label="Remove"><Trash2 size={14} /></button></div>
@@ -61,9 +76,28 @@ export function Cart() {
           })}
         </div>
         <div className="card stack">
-          <Receipt rows={[['Items', pay(total)], ['Buyer fees', pay(0), true]]} total={['Total', pay(total)]} />
+          <Receipt rows={[['Items', pay(total - feeBase)], ...(physical.length ? [['Delivery', dv.method === 'pickup' ? 'Free (pickup)' : zone ? pay(feeBase) : 'Arranged with seller']] : []), ['Buyer fees', pay(0), true]]} total={['Total', pay(total)]} />
           {!user ? <Link className="btn btn-accent btn-block" to="/login" state={{ from: '/cart' }}>Log in to check out</Link> : (
             <>
+              {physical.length > 0 && (
+                <div className="stack">
+                  <h3>How do you want to get it?</h3>
+                  <div className="chips">
+                    <button type="button" className={`chip ${dv.method === 'ship' ? 'on' : ''}`} onClick={() => setDv({ ...dv, method: 'ship' })}>Delivery</button>
+                    <button type="button" className={`chip ${dv.method === 'pickup' ? 'on' : ''}`} onClick={() => setDv({ ...dv, method: 'pickup' })}>Pickup</button>
+                  </div>
+                  <Field label="Your name"><input value={dv.name} onChange={setD('name')} autoComplete="name" /></Field>
+                  <Field label="Phone number the seller can call"><input value={dv.phone} onChange={setD('phone')} inputMode="tel" autoComplete="tel" placeholder="+232 …" /></Field>
+                  {dv.method === 'ship' ? (
+                    <>
+                      {zones.length > 0 && <Field label="Delivery area"><select value={dv.zone} onChange={setD('zone')}><option value="">Choose your area…</option>{zones.map((z) => <option key={z.name} value={z.name}>{z.name} ({formatIn(convert(z.feeMinor, payCode), payCode)})</option>)}</select></Field>}
+                      <Field label="Address"><textarea value={dv.address} onChange={setD('address')} placeholder="Street, landmark, house number" /></Field>
+                      {sellerCount > 1 && zones.length > 0 && <p className="muted small">Your cart has items from {sellerCount} sellers, so the delivery fee is charged once per seller.</p>}
+                    </>
+                  ) : <p className="muted small">You collect it from the seller. They will contact you with the exact place and time{physical.length === 1 && physical[0].listing.location ? ` (listed location: ${physical[0].listing.location})` : ''}.</p>}
+                  <Field label="Note for the seller (optional)"><input value={dv.note} onChange={setD('note')} maxLength={300} /></Field>
+                </div>
+              )}
               <div>
                 {payOptions.length > 1 && (
                   <div style={{ marginBottom: 14 }}>
@@ -77,13 +111,14 @@ export function Cart() {
                 {methods.map((m) => (
                   <label key={m.key} className={`method ${method === m.key ? 'on' : ''}`}>
                     <input type="radio" name="method" checked={method === m.key} onChange={() => setMethod(m.key)} />
-                    <span><b>{m.label}</b>{m.kind === 'manual' && <span className="muted small"><br />Send from your phone, then enter the transaction ID</span>}</span>
+                    <span><b>{m.label}</b>{m.kind === 'manual' && <span className="muted small"><br />Send from your phone, then enter the transaction ID</span>}{m.kind === 'cod' && <span className="muted small"><br />Pay the seller in cash when you receive it</span>}</span>
                   </label>
                 ))}
               </div>
+              <Field label="Coupon code (optional)" hint="The discount is worked out when you pay."><input value={coupon} onChange={(e) => setCoupon(e.target.value.toUpperCase())} maxLength={20} /></Field>
               <Alert>{error}</Alert>
-              <button className="btn btn-accent btn-block" disabled={busy || !method} onClick={checkout}>{busy ? 'Please wait…' : `Pay ${pay(total)}`}</button>
-              <p className="muted small">Your money is held by {brand.name} and only released to the seller once you confirm everything is as described.</p>
+              <button className="btn btn-accent btn-block" disabled={busy || !method} onClick={checkout}>{busy ? 'Please wait…' : methods.find((m) => m.key === method)?.kind === 'cod' ? `Place order · ${pay(total)} on delivery` : `Pay ${pay(total)}`}</button>
+              <p className="muted small">{methods.find((m) => m.key === method)?.kind === 'cod' ? 'Pay in cash only when you have the item in your hands.' : `Your money is held by ${brand.name} and only released to the seller once you confirm everything is as described.`}</p>
             </>
           )}
         </div>

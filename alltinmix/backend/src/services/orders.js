@@ -12,6 +12,7 @@ const db = require('../db');
 const config = require('../config');
 const { HttpError, commissionMinor } = require('../lib/util');
 const { notify, notifyAdmins } = require('../lib/notify');
+const coupons = require('./coupons');
 const payments = require('../payments');
 
 const symbolGap = /[A-Za-z]$/.test(config.marketplace.currency.symbol) ? ' ' : ''; // "Le 85.00" but "$85.00"
@@ -41,20 +42,48 @@ async function getCommissionPct(q = db) {
   return rows[0] ? Number(rows[0].value) : config.marketplace.commissionPctDefault;
 }
 
+async function getDeliveryZones(q = db) {
+  const { rows } = await q.query("SELECT value FROM settings WHERE key = 'deliveryZones'");
+  return rows[0] ? rows[0].value : config.deliveryZonesDefault;
+}
+
+/** Validate what the buyer typed for delivery. Returns { method, zone, address } for physical orders. */
+function parseDelivery(raw, zones) {
+  const d = raw || {};
+  if (!['ship', 'pickup'].includes(d.method)) throw new HttpError(400, 'Choose delivery or pickup.', { code: 'DELIVERY_REQUIRED' });
+  const phone = String(d.phone || '').trim();
+  if (phone.replace(/\D/g, '').length < 7) throw new HttpError(400, 'Enter a phone number the seller can reach you on.', { code: 'DELIVERY_PHONE' });
+  const name = String(d.name || '').trim().slice(0, 100);
+  const note = String(d.note || '').trim().slice(0, 300);
+  if (d.method === 'pickup') return { method: 'pickup', zone: null, fee: 0, address: { name, phone, note } };
+  const address = String(d.address || '').trim().slice(0, 300);
+  if (address.length < 5) throw new HttpError(400, 'Enter your delivery address.', { code: 'DELIVERY_ADDRESS' });
+  let zone = null;
+  let fee = 0;
+  if (zones.length) {
+    zone = zones.find((z) => z.name === d.zone);
+    if (!zone) throw new HttpError(400, 'Choose your delivery area.', { code: 'DELIVERY_ZONE' });
+    fee = zone.feeMinor;
+  }
+  return { method: 'ship', zone: zone ? zone.name : null, fee, address: { name, phone, address, note } };
+}
+
 // ---------------------------------------------------------------- checkout
 
-async function checkout(user, rawItems, methodKey, currencyCode) {
+async function checkout(user, rawItems, methodKey, currencyCode, deliveryInput, couponCode) {
   const method = payments.getMethod(methodKey);
   const payCode = String(currencyCode || config.baseCurrency).toUpperCase();
   if (!method.currencies.includes(payCode)) {
     throw new HttpError(400, `${method.label} can't be paid in ${payCode}. Choose ${method.currencies.join(' or ')} or another method.`, { code: 'CURRENCY_UNSUPPORTED' });
   }
   const provider = payments.providerByName(method.provider);
+  const isCod = method.kind === 'cod';
 
   // Merge duplicate lines, then lock listings in a fixed order so two checkouts can't deadlock.
   const merged = new Map();
-  for (const it of rawItems) merged.set(it.listingId, (merged.get(it.listingId) || 0) + it.qty);
-  const lines = [...merged.entries()].map(([listingId, qty]) => ({ listingId, qty })).sort((a, b) => a.listingId.localeCompare(b.listingId));
+  const offerOf = new Map();
+  for (const it of rawItems) { merged.set(it.listingId, (merged.get(it.listingId) || 0) + it.qty); if (it.offerId) offerOf.set(it.listingId, it.offerId); }
+  const lines = [...merged.entries()].map(([listingId, qty]) => ({ listingId, qty, offerId: offerOf.get(listingId) })).sort((a, b) => a.listingId.localeCompare(b.listingId));
 
   const created = await db.tx(async (c) => {
     const pct = await getCommissionPct(c);
@@ -73,32 +102,89 @@ async function checkout(user, rawItems, methodKey, currencyCode) {
       if (l.seller_id === user.id) throw new HttpError(400, "You can't buy your own listing.");
 
       const digital = l.fulfillment === 'digital';
-      const qty = vertical.commerce === 'service' || digital ? 1 : line.qty;
+      let qty = vertical.commerce === 'service' || digital ? 1 : line.qty;
+      let unit = l.price_minor;
+      if (line.offerId) {
+        // A negotiated price: valid only for the buyer, for the agreed quantity, until it expires, and only once.
+        const { rows: of } = await c.query('SELECT * FROM offers WHERE id = $1 FOR UPDATE', [line.offerId]);
+        const off = of[0];
+        if (!off || off.buyer_id !== user.id || off.listing_id !== l.id || off.status !== 'accepted' || new Date(off.expires_at) < new Date()) {
+          throw new HttpError(409, `The agreed price for "${l.title}" is no longer valid. Remove it from your cart or make a new offer.`, { code: 'OFFER_INVALID' });
+        }
+        qty = off.qty;
+        unit = Number(off.agreed_minor);
+      }
       if (l.stock !== null) {
         if (l.stock < qty) throw new HttpError(409, l.stock === 0 ? `"${l.title}" is out of stock.` : `Only ${l.stock} left of "${l.title}".`, { code: 'OUT_OF_STOCK' });
         await c.query('UPDATE listings SET stock = stock - $2, updated_at = now() WHERE id = $1', [l.id, qty]);
       }
-      const lineTotal = l.price_minor * qty;
-      orders.push({ id: crypto.randomUUID(), listing: l, qty, lineTotal, commission: commissionMinor(lineTotal, pct), pct });
-      total += lineTotal;
+      const lineTotal = unit * qty;
+      orders.push({ id: crypto.randomUUID(), listing: l, qty, unit, offerId: line.offerId, lineTotal, commission: commissionMinor(lineTotal, pct), pct, physical: l.fulfillment === 'physical', fee: 0 });
+    }
+
+    // Coupon: seller-funded discount. Commission is charged on the price after the discount.
+    let coupon = null;
+    if (couponCode) {
+      coupon = await coupons.loadCoupon(c, couponCode, user.id, { lock: true });
+      const ds = coupons.discountsFor(coupon, orders.map((o) => ({ sellerId: o.listing.seller_id, lineTotal: o.lineTotal, haggled: !!o.offerId })));
+      orders.forEach((o, i) => { o.discount = ds[i]; o.lineTotal -= ds[i]; o.commission = commissionMinor(o.lineTotal, o.pct); });
+      if (!ds.some((d) => d > 0)) throw new HttpError(400, 'That coupon gives no discount on this cart.', { code: 'COUPON_NOT_APPLICABLE' });
+    }
+
+    // Delivery: physical goods are shipped to the buyer or picked up. One delivery fee per seller.
+    const physical = orders.filter((o) => o.physical);
+    let delivery = null;
+    if (physical.length) {
+      delivery = parseDelivery(deliveryInput, await getDeliveryZones(c));
+      if (delivery.method === 'ship' && delivery.fee > 0) {
+        const charged = new Set();
+        for (const o of physical) if (!charged.has(o.listing.seller_id)) { charged.add(o.listing.seller_id); o.fee = delivery.fee; }
+      }
+    }
+    for (const o of orders) total += o.lineTotal + o.fee;
+
+    if (isCod) {
+      if (orders.some((o) => !o.physical)) throw new HttpError(400, 'Cash on delivery is only for physical items. Remove services or downloads, or choose another way to pay.', { code: 'COD_NOT_AVAILABLE' });
+      if (config.cod.maxMinor && total > config.cod.maxMinor) throw new HttpError(400, `Cash on delivery is limited to ${money(config.cod.maxMinor)} per order. Choose another way to pay.`, { code: 'COD_TOO_LARGE' });
+      for (const sellerId of new Set(orders.map((o) => o.listing.seller_id))) {
+        const { rows: bal } = await c.query('SELECT COALESCE(sum(amount_minor),0) AS n FROM wallet_entries WHERE user_id = $1', [sellerId]);
+        if (Number(bal[0].n) < -config.cod.sellerDebtLimitMinor) throw new HttpError(409, 'This seller cannot take cash-on-delivery orders right now. Please choose another way to pay.', { code: 'COD_SELLER_BLOCKED' });
+      }
     }
 
     const payAmount = convertMinor(total, rate);
     await c.query(
       'INSERT INTO payments (id, buyer_id, provider, method, amount_minor, currency, status, base_amount_minor, fx_rate) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)',
-      [paymentId, user.id, method.provider, method.key, payAmount, payCode, 'pending', total, rate]
+      [paymentId, user.id, method.provider, method.key, payAmount, payCode, isCod ? 'cod' : 'pending', total, rate]
     );
     for (const o of orders) {
       await c.query(
         `INSERT INTO orders (id, payment_id, listing_id, title, type, fulfillment, qty, unit_price_minor, total_minor, currency,
-           buyer_id, seller_id, commission_pct, commission_minor, seller_earnings_minor, status)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,'awaiting_payment')`,
-        [o.id, paymentId, o.listing.id, o.listing.title, o.listing.type, o.listing.fulfillment, o.qty, o.listing.price_minor, o.lineTotal,
-          config.marketplace.currency.code, user.id, o.listing.seller_id, o.pct, o.commission, o.lineTotal - o.commission]
+           buyer_id, seller_id, commission_pct, commission_minor, seller_earnings_minor, status,
+           delivery_method, delivery_fee_minor, delivery_zone, delivery_address, discount_minor, coupon_code)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)`,
+        [o.id, paymentId, o.listing.id, o.listing.title, o.listing.type, o.listing.fulfillment, o.qty, o.unit, o.lineTotal + o.fee,
+          config.marketplace.currency.code, user.id, o.listing.seller_id, o.pct, o.commission, o.lineTotal - o.commission + o.fee,
+          isCod ? 'pending_acceptance' : 'awaiting_payment',
+          o.physical ? delivery.method : null, o.fee, o.physical ? delivery.zone : null,
+          o.physical ? JSON.stringify({ ...delivery.address, ...(delivery.method === 'pickup' ? { pickupLocation: o.listing.location || '' } : {}) }) : null,
+          o.discount || 0, o.discount ? coupon.code : null]
       );
+      if (o.discount) {
+        await c.query('INSERT INTO coupon_uses (coupon_id, user_id, order_id) VALUES ($1,$2,$3) ON CONFLICT (coupon_id, user_id) DO NOTHING', [coupon.id, user.id, o.id]);
+      }
+      if (o.offerId) await c.query("UPDATE offers SET status = 'used', order_id = $2, updated_at = now() WHERE id = $1", [o.offerId, o.id]);
+      if (isCod) {
+        await c.query('UPDATE listings SET sold_count = sold_count + $2 WHERE id = $1', [o.listing.id, o.qty]);
+        await notify(c, { userId: o.listing.seller_id, type: 'order_received', email: true, sms: true, link: '/seller/orders', title: `New cash-on-delivery order: ${o.listing.title}`, body: `Collect ${money(o.lineTotal + o.fee)} in cash when you hand it over. The platform fee of ${money(o.commission)} is deducted from your balance.` });
+        await notify(c, { userId: user.id, type: 'order_placed', email: true, link: '/orders', title: `Order placed: ${o.listing.title}`, body: `Pay ${money(o.lineTotal + o.fee)} in cash when it arrives.` });
+      }
     }
+    if (coupon) await c.query('UPDATE coupons SET used_count = used_count + 1 WHERE id = $1', [coupon.id]);
     return { paymentId, total, payAmount, titles: orders.map((o) => o.listing.title) };
   });
+
+  if (isCod) return { paymentId: created.paymentId, method: method.key, kind: 'cod', redirectUrl: '/orders', totalMinor: created.total, payAmountMinor: created.payAmount, payCurrency: payCode };
 
   // The provider call happens outside the transaction (it is a slow network request).
   const description = created.titles.length === 1 ? created.titles[0] : `${created.titles.length} items from ${config.marketplace.brand.name}`;
@@ -152,7 +238,7 @@ async function markPaymentPaid(paymentId, { providerTxnId } = {}) {
         body: digital ? 'Your purchase is complete. Open My Orders to get your download.' : `Your payment of ${money(o.total_minor)} is held safely until you confirm delivery.`,
       });
       await notify(c, {
-        userId: o.seller_id, type: 'order_received', email: true, link: '/seller/orders',
+        userId: o.seller_id, type: 'order_received', email: true, sms: true, link: '/seller/orders',
         title: `New order: ${o.title}`,
         body: `You earn ${money(o.seller_earnings_minor)} once it is completed (after the platform fee).`,
       });
@@ -182,6 +268,11 @@ async function failPayment(paymentId, reason = 'Payment not completed', { notify
     const { rows: orders } = await c.query("SELECT * FROM orders WHERE payment_id = $1 AND status = 'awaiting_payment' FOR UPDATE", [paymentId]);
     for (const o of orders) {
       await c.query("UPDATE orders SET status = 'cancelled', updated_at = now() WHERE id = $1", [o.id]);
+      // ...and gives a coupon back so the buyer can use it again.
+      const freed = await c.query('DELETE FROM coupon_uses WHERE order_id = $1 RETURNING coupon_id', [o.id]);
+      if (freed.rowCount) await c.query('UPDATE coupons SET used_count = GREATEST(used_count - 1, 0) WHERE id = $1', [freed.rows[0].coupon_id]);
+      // An unpaid checkout gives the negotiated price back to the buyer while it is still valid.
+      await c.query("UPDATE offers SET status = 'accepted', order_id = NULL, updated_at = now() WHERE order_id = $1 AND status = 'used' AND expires_at > now()", [o.id]);
       if (o.listing_id) await c.query('UPDATE listings SET stock = stock + $2 WHERE id = $1 AND stock IS NOT NULL', [o.listing_id, o.qty]);
       if (notifyBuyer) await notify(c, { userId: o.buyer_id, type: 'payment_failed', email: true, link: '/orders', title: `Payment not confirmed: ${o.title}`, body: reason });
     }
@@ -286,6 +377,16 @@ async function refundOrder(c, order, finalStatus, { restock = false } = {}) {
 /** Mark an order complete and credit the seller's balance exactly once. */
 async function completeOrder(c, order) {
   await c.query("UPDATE orders SET status = 'completed', completed_at = now(), updated_at = now() WHERE id = $1", [order.id]);
+  const { rows: pay } = await c.query('SELECT status FROM payments WHERE id = $1', [order.payment_id]);
+  if (pay[0] && pay[0].status === 'cod') {
+    // The seller already collected the cash, so only the platform fee is charged to their balance.
+    await c.query(
+      "INSERT INTO wallet_entries (user_id, kind, amount_minor, order_id, note) VALUES ($1,'commission_due',$2,$3,$4) ON CONFLICT DO NOTHING",
+      [order.seller_id, -order.commission_minor, order.id, `Platform fee (cash on delivery): ${order.title}`]
+    );
+    await notify(c, { userId: order.seller_id, type: 'order_status', email: true, link: '/seller/earnings', title: `Order completed: ${order.title}`, body: `The platform fee of ${money(order.commission_minor)} was deducted from your balance. It is settled from your future earnings or when you pay it to us.` });
+    return;
+  }
   await c.query(
     "INSERT INTO wallet_entries (user_id, kind, amount_minor, order_id, note) VALUES ($1,'earning',$2,$3,$4) ON CONFLICT DO NOTHING",
     [order.seller_id, order.seller_earnings_minor, order.id, `Order: ${order.title}`]
@@ -311,13 +412,13 @@ async function transition(user, orderId, action, body = {}) {
         if (!isSeller) throw notAllowed();
         if (o.status !== 'pending_acceptance') throw wrongState();
         await c.query("UPDATE orders SET status = 'in_progress', updated_at = now() WHERE id = $1", [o.id]);
-        await notify(c, { userId: o.buyer_id, type: 'order_status', email: true, link: '/orders', title: `Order accepted: ${o.title}`, body: 'The seller has accepted your order and is working on it.' });
+        await notify(c, { userId: o.buyer_id, type: 'order_status', email: true, sms: true, link: '/orders', title: `Order accepted: ${o.title}`, body: 'The seller has accepted your order and is working on it.' });
         break;
       case 'deliver':
         if (!isSeller) throw notAllowed();
         if (o.status !== 'in_progress') throw wrongState();
         await c.query("UPDATE orders SET status = 'delivered', delivered_at = now(), updated_at = now() WHERE id = $1", [o.id]);
-        await notify(c, { userId: o.buyer_id, type: 'order_status', email: true, link: '/orders', title: `Delivered: ${o.title}`, body: `Please confirm it arrived as expected. Payment is released to the seller when you confirm (or automatically after ${config.autoCompleteDays} days).` });
+        await notify(c, { userId: o.buyer_id, type: 'order_status', email: true, sms: true, link: '/orders', title: `Delivered: ${o.title}`, body: `Please confirm it arrived as expected. Payment is released to the seller when you confirm (or automatically after ${config.autoCompleteDays} days).` });
         break;
       case 'confirm':
         if (!isBuyer) throw notAllowed();
@@ -373,7 +474,7 @@ async function getOrder(id) {
 
 // ---------------------------------------------------------------- reviews
 
-async function createReview(user, orderId, { rating, comment }) {
+async function createReview(user, orderId, { rating, comment, images = [] }) {
   return db.tx(async (c) => {
     const { rows } = await c.query('SELECT * FROM orders WHERE id = $1 FOR UPDATE', [orderId]);
     const o = rows[0];
@@ -381,7 +482,7 @@ async function createReview(user, orderId, { rating, comment }) {
     if (o.status !== 'completed') throw new HttpError(409, 'You can review an order once it is completed.');
     const dup = await c.query('SELECT 1 FROM reviews WHERE order_id = $1', [orderId]);
     if (dup.rowCount) throw new HttpError(409, 'You already reviewed this order.');
-    await c.query('INSERT INTO reviews (order_id, listing_id, reviewer_id, seller_id, rating, comment) VALUES ($1,$2,$3,$4,$5,$6)', [orderId, o.listing_id, user.id, o.seller_id, rating, comment || '']);
+    await c.query('INSERT INTO reviews (order_id, listing_id, reviewer_id, seller_id, rating, comment, images) VALUES ($1,$2,$3,$4,$5,$6,$7)', [orderId, o.listing_id, user.id, o.seller_id, rating, comment || '', JSON.stringify(images)]);
     if (o.listing_id) {
       await c.query(
         `UPDATE listings SET rating_count = (SELECT count(*) FROM reviews WHERE listing_id = $1),
@@ -425,6 +526,7 @@ async function autoCompleteDelivered() {
 const ORDER_SELECT = `
   SELECT o.*, b.name AS buyer_name, s.name AS seller_name,
          EXISTS (SELECT 1 FROM reviews r WHERE r.order_id = o.id) AS reviewed,
+         b.phone AS buyer_phone, s.phone AS seller_phone,
          p.method AS payment_method, p.status AS payment_status,
          p.currency AS paid_currency, p.amount_minor AS paid_amount_minor, p.base_amount_minor AS paid_base_minor
   FROM orders o
@@ -458,6 +560,15 @@ function orderToApi(r, { forSeller = false } = {}) {
     refundManual: r.refund_manual,
     refundSettledAt: r.refund_settled_at,
     reviewed: r.reviewed,
+    discountMinor: r.discount_minor,
+    couponCode: r.coupon_code,
+    deliveryMethod: r.delivery_method,
+    deliveryFeeMinor: r.delivery_fee_minor,
+    deliveryZone: r.delivery_zone,
+    deliveryAddress: r.delivery_address,
+    buyerPhone: forSeller ? (r.delivery_address && r.delivery_address.phone) || r.buyer_phone : undefined,
+    sellerPhone: forSeller ? undefined : r.seller_phone,
+    cod: r.payment_status === 'cod',
     paymentMethod: r.payment_method,
     paymentStatus: r.payment_status,
     // What the buyer was actually charged for this order (differs from totalMinor when they paid in another currency).
@@ -471,7 +582,7 @@ function orderToApi(r, { forSeller = false } = {}) {
 }
 
 module.exports = {
-  getCommissionPct, getRates, convertMinor, moneyIn, checkout, markPaymentPaid, failPayment, verifyPayment, handleWebhook,
+  getCommissionPct, getRates, getDeliveryZones, convertMinor, moneyIn, checkout, markPaymentPaid, failPayment, verifyPayment, handleWebhook,
   submitManualProof, confirmManualPayment, rejectManualPayment,
   transition, resolveDispute, createReview, getOrder,
   expireStalePayments, autoCompleteDelivered, ORDER_SELECT, orderToApi, money,

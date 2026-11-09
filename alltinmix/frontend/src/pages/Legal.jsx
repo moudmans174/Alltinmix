@@ -62,6 +62,7 @@ export function Terms() {
         <li>Sellers are responsible for their listings, prices, descriptions, and for delivering what they sell.</li>
         <li>Payments are held by {brand.name} until the buyer confirms the order is as described (or it is automatically confirmed after the review period). A platform fee of {commissionPct}% is deducted from the seller's earnings.</li>
         <li>If something goes wrong, a buyer can open a dispute and our team will decide whether to release or refund the payment.</li>
+        <li>With cash on delivery, the buyer pays the seller in cash when the item is handed over, and the seller owes the platform fee to {brand.name}. Delivery fees go to the seller. Pickup and delivery details are shared between the buyer and seller only.</li>
         <li>Mobile money payments are confirmed manually and may take time. Refunds and withdrawals are processed by our team.</li>
       </ul>
       <h3>What is not allowed</h3>

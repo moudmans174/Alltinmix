@@ -280,3 +280,20 @@ td { padding: 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
   .toasts, .toast-wrap { bottom: calc(72px + env(safe-area-inset-bottom)); }
 }
 @media (max-width: 860px) { body:has(.modal-back) .tabbar { display: none; } }
+.theme-toggle.on { color: var(--accent); }
+
+/* ---- wishlist, timeline, review photos ---- */
+.thumb { position: relative; }
+.heart { position: absolute; top: 8px; right: 8px; width: 34px; height: 34px; border-radius: 50%; border: 0; display: grid; place-items: center; cursor: pointer; background: rgba(255,255,255,.92); color: #444; box-shadow: 0 1px 4px rgba(0,0,0,.2); }
+.heart.on { color: #e11d48; }
+.heart-inline { position: static; flex: none; border: 1px solid var(--line); box-shadow: none; background: var(--surface); }
+.timeline { list-style: none; margin: 12px 0 4px; padding: 0 0 0 18px; border-left: 2px solid var(--line); display: grid; gap: 12px; }
+.timeline li { position: relative; display: grid; gap: 2px; }
+.timeline li::before { content: ''; position: absolute; left: -24px; top: 4px; width: 10px; height: 10px; border-radius: 50%; background: var(--line); }
+.timeline li.now::before { background: var(--accent); }
+.review-photos { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+.review-photos img { width: 72px; height: 72px; object-fit: cover; border-radius: 8px; border: 1px solid var(--line); }
+
+/* Trust & growth */
+.verified-badge { display: inline-flex; align-items: center; gap: 3px; color: var(--green, #16875a); font-weight: 600; font-size: .8rem; vertical-align: middle; }
+.listing-card .thumb .tag-sponsored { left: auto; right: 8px; top: auto; bottom: 8px; background: rgba(0,0,0,.65); color: #fff; }

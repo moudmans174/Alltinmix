@@ -89,7 +89,7 @@ account.delete('/', async (req, res) => {
     if (open.rows[0].n > 0) throw new HttpError(409, 'You still have orders in progress. Finish or cancel them first, then delete your account.', { code: 'ACTIVE_ORDERS' });
     const bal = await c.query('SELECT COALESCE(sum(amount_minor),0)::bigint AS n FROM wallet_entries WHERE user_id = $1', [req.user.id]);
     const pend = await c.query("SELECT count(*)::int AS n FROM payouts WHERE user_id = $1 AND status = 'requested'", [req.user.id]);
-    if (Number(bal.rows[0].n) > 0 || pend.rows[0].n > 0) throw new HttpError(409, 'You still have money in your wallet or a withdrawal in progress. Withdraw it first, then delete your account.', { code: 'WALLET_NOT_EMPTY' });
+    if (Number(bal.rows[0].n) !== 0 || pend.rows[0].n > 0) throw new HttpError(409, 'Your wallet balance is not zero (or a withdrawal is in progress). Withdraw what you are owed, or settle what you owe, then delete your account.', { code: 'WALLET_NOT_EMPTY' });
 
     const dead = await hashPassword(crypto.randomBytes(24).toString('hex'));
     await c.query(

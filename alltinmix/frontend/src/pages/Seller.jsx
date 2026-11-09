@@ -5,13 +5,15 @@ import { api, assetUrl } from '../api';
 import { useAuth, useConfig, useToast } from '../context';
 import { Alert, Empty, Field, Receipt, Spinner, StatusPill } from '../components/ui';
 
-function SellerTabs() {
+export function SellerTabs() {
   const cls = ({ isActive }) => `tab-link ${isActive ? 'on' : ''}`;
   return (
     <div className="tabs">
       <NavLink className={cls} to="/seller/listings">My listings</NavLink>
       <NavLink className={cls} to="/seller/orders">Sales</NavLink>
+      <NavLink className={cls} to="/seller/offers">Offers</NavLink>
       <NavLink className={cls} to="/seller/earnings">Earnings</NavLink>
+      <NavLink className={cls} to="/seller/growth">Grow</NavLink>
     </div>
   );
 }
@@ -213,8 +215,9 @@ export function Earnings() {
     <div className="container page">
       <SellerTabs />
       <h1>Earnings</h1>
+      {w.owedMinor > 0 && <Alert kind="info">You owe the platform {formatMoney(w.owedMinor)} in fees from cash-on-delivery sales. It is taken from your next earnings. You can also pay it to us directly: contact support and we will record it. Above a limit, new cash-on-delivery orders are paused until it is cleared.</Alert>}
       <div className="grid grid-4">
-        <div className="stat"><small>Available to withdraw</small><b>{formatMoney(w.availableMinor)}</b></div>
+        <div className="stat"><small>{w.availableMinor < 0 ? 'You owe (cash sales fees)' : 'Available to withdraw'}</small><b>{formatMoney(w.availableMinor < 0 ? -w.availableMinor : w.availableMinor)}</b></div>
         <div className="stat"><small>In progress (held)</small><b>{formatMoney(w.pendingMinor)}</b></div>
         <div className="stat"><small>Withdrawn</small><b>{formatMoney(w.withdrawnMinor)}</b></div>
         <div className="stat"><small>Lifetime earned</small><b>{formatMoney(w.lifetimeEarnedMinor)}</b></div>

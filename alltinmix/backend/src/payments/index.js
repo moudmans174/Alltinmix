@@ -53,8 +53,18 @@ const momo = {
   },
 };
 
+/** Cash on delivery: no money moves online. The seller collects cash and the platform fee is charged to their balance. */
+const cod = {
+  name: 'cod',
+  async createCheckout({ payment }) { return { redirectUrl: '/orders', providerRef: payment.id }; },
+  async verify() { return { status: 'pending' }; },
+  parseWebhook() { return null; },
+  async refund() { return { ref: null }; },
+};
+
 const providers = {
   mock,
+  cod,
   momo,
   stripe: require('./stripe'),
   flutterwave: require('./flutterwave'),

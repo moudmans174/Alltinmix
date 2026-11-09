@@ -114,12 +114,19 @@ export function CartProvider({ children }) {
   const value = useMemo(() => ({
     items,
     count: items.reduce((n, i) => n + i.qty, 0),
+    /** Add a listing at a price the seller agreed to (an accepted offer). One line per offer, quantity fixed. */
+    addOffer(listing, offer) {
+      setItems((prev) => {
+        const snapshot = { id: listing.id, title: listing.title, priceMinor: offer.agreedMinor, type: listing.type, fulfillment: listing.fulfillment, stock: null, sellerName: listing.sellerName, sellerId: listing.sellerId, location: listing.location || '', image: listing.images?.[0] || null, offerId: offer.id };
+        return [...prev.filter((x) => x.listingId !== listing.id), { listingId: listing.id, qty: offer.qty, offerId: offer.id, listing: snapshot }];
+      });
+    },
     add(listing, qty = 1) {
       setItems((prev) => {
         const cap = listing.stock ?? 99;
         const unit = listing.type === 'service' || listing.fulfillment === 'digital' ? 1 : qty;
         const i = prev.findIndex((x) => x.listingId === listing.id);
-        const snapshot = { id: listing.id, title: listing.title, priceMinor: listing.priceMinor, type: listing.type, fulfillment: listing.fulfillment, stock: listing.stock, sellerName: listing.sellerName, image: listing.images?.[0] || null };
+        const snapshot = { id: listing.id, title: listing.title, priceMinor: listing.priceMinor, type: listing.type, fulfillment: listing.fulfillment, stock: listing.stock, sellerName: listing.sellerName, sellerId: listing.sellerId, location: listing.location || '', image: listing.images?.[0] || null };
         if (i >= 0) { const next = [...prev]; next[i] = { ...next[i], listing: snapshot, qty: Math.min(unit === 1 ? 1 : next[i].qty + unit, cap) }; return next; }
         return [...prev, { listingId: listing.id, qty: Math.min(unit, cap), listing: snapshot }];
       });
@@ -142,6 +149,11 @@ export function ThemeProvider({ children }) {
   const [theme, setTheme] = useState(() => {
     try { return localStorage.getItem('theme') || systemTheme(); } catch { return systemTheme(); }
   });
+  // Low-data mode: photos are not downloaded until the visitor asks. On by default when the phone's Data Saver is on.
+  const [lowData, setLowData] = useState(() => {
+    try { const v = localStorage.getItem('lowData'); if (v !== null) return v === '1'; } catch { /* ignore */ }
+    return !!(typeof navigator !== 'undefined' && navigator.connection && navigator.connection.saveData);
+  });
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
     const meta = document.querySelector('meta[name="theme-color"]');
@@ -149,15 +161,43 @@ export function ThemeProvider({ children }) {
   }, [theme]);
   const value = useMemo(() => ({
     theme,
+    lowData,
+    toggleLowData: () => setLowData((v) => { try { localStorage.setItem('lowData', v ? '0' : '1'); } catch { /* private mode */ } return !v; }),
     toggle: () => setTheme((t) => {
       const next = t === 'dark' ? 'light' : 'dark';
       try { localStorage.setItem('theme', next); } catch { /* private mode: still works for this visit */ }
       return next;
     }),
-  }), [theme]);
+  }), [theme, lowData]);
   return <ThemeCtx.Provider value={value}>{children}</ThemeCtx.Provider>;
 }
 export const useTheme = () => useContext(ThemeCtx);
+
+/* ------------------------------------------------------------------ wishlist */
+
+const WishCtx = createContext({ has: () => false, toggle: async () => {}, count: 0 });
+export function WishlistProvider({ children }) {
+  const { user } = useAuth();
+  const [ids, setIds] = useState([]);
+  useEffect(() => {
+    if (!user) { setIds([]); return; }
+    api.get('/wishlist/ids').then((d) => setIds(d.ids)).catch(() => {});
+  }, [user]);
+  const value = useMemo(() => ({
+    count: ids.length,
+    has: (id) => ids.includes(id),
+    /** Returns true if the listing is now saved, false if removed, null if the visitor needs to log in. */
+    toggle: async (id) => {
+      if (!user) return null;
+      const saved = ids.includes(id);
+      setIds((p) => (saved ? p.filter((x) => x !== id) : [...p, id]));
+      try { saved ? await api.del(`/wishlist/${id}`) : await api.post('/wishlist', { listingId: id }); } catch { setIds((p) => (saved ? [...p, id] : p.filter((x) => x !== id))); }
+      return !saved;
+    },
+  }), [ids, user]);
+  return <WishCtx.Provider value={value}>{children}</WishCtx.Provider>;
+}
+export const useWishlist = () => useContext(WishCtx);
 
 /* ------------------------------------------------------------------ toasts */
 

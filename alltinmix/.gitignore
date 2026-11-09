@@ -3,6 +3,7 @@ dist/
 .env
 *.log
 backend/uploads/
+backend/private/
 .DS_Store
 frontend/.env.app
 frontend/android/app/build/

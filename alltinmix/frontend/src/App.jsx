@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { Link, NavLink, Route, Routes, useLocation, useNavigate } from 'react-router-dom';
-import { Bell, Home as HomeIcon, Menu, MessageSquare, Moon, PlusCircle, Search, ShoppingCart, Sun, User, X } from 'lucide-react';
+import { Bell, Heart, Home as HomeIcon, Menu, MessageSquare, Moon, PlusCircle, Zap, Search, ShoppingCart, Sun, User, X } from 'lucide-react';
 import { api } from './api';
 import { useAuth, useCart, useConfig, useTheme, useToast } from './context';
 import { Protected } from './components/ui';
@@ -12,6 +12,9 @@ import { Inbox, Thread } from './pages/Messages';
 import { SellerListings, ListingForm, Earnings } from './pages/Seller';
 import { Admin } from './pages/Admin';
 import { Privacy, Terms } from './pages/Legal';
+import { Store, Protection } from './pages/Store';
+import { SellerGrowth } from './pages/Growth';
+import { MyOffers, SellerOffers, Wishlist } from './pages/Buyer';
 import { initNative, setStatusBar } from './native';
 
 function NotificationBell() {
@@ -59,7 +62,7 @@ function Header() {
   const { brand } = useConfig();
   const { user, logout } = useAuth();
   const { count } = useCart();
-  const { theme, toggle } = useTheme();
+  const { theme, toggle, lowData, toggleLowData } = useTheme();
   const { currencies, displayCurrency, setDisplayCurrency } = useConfig();
   const [open, setOpen] = useState(false);
   const [q, setQ] = useState('');
@@ -84,6 +87,8 @@ function Header() {
           {user ? (
             <>
               <NavLink to="/orders">My orders</NavLink>
+              <NavLink to="/offers">Offers</NavLink>
+              <NavLink to="/wishlist" aria-label="Saved items"><Heart size={18} /></NavLink>
               {seller && <NavLink to="/seller/listings">Sell</NavLink>}
               {seller && <NavLink to="/seller/orders">Sales</NavLink>}
               {user.role === 'admin' && <NavLink to="/admin">Admin</NavLink>}
@@ -103,6 +108,7 @@ function Header() {
               {currencies.map((c) => <option key={c.code} value={c.code}>{c.symbol} {c.code}</option>)}
             </select>
           )}
+          <button className={`theme-toggle ${lowData ? 'on' : ''}`} onClick={toggleLowData} aria-pressed={lowData} aria-label="Low-data mode" title={lowData ? 'Low-data mode is on: photos are hidden until you tap them' : 'Low-data mode: save mobile data'}><Zap size={18} /></button>
           <button className="theme-toggle" onClick={toggle} aria-label={theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'} title={theme === 'dark' ? 'Light theme' : 'Dark theme'}>{theme === 'dark' ? <Sun size={18} /> : <Moon size={18} />}</button>
           <NavLink to="/cart" aria-label="Cart"><ShoppingCart size={18} />{count > 0 && <span className="badge">{count}</span>}</NavLink>
         </nav>
@@ -188,6 +194,12 @@ export default function App() {
           <Route path="/reset-password" element={<Reset />} />
           <Route path="/verify-email" element={<VerifyEmail />} />
           <Route path="/account" element={<P><Account /></P>} />
+          <Route path="/store/:id" element={<Store />} />
+          <Route path="/protection" element={<Protection />} />
+          <Route path="/seller/growth" element={<P roles={seller}><SellerGrowth /></P>} />
+          <Route path="/wishlist" element={<P><Wishlist /></P>} />
+          <Route path="/offers" element={<P><MyOffers /></P>} />
+          <Route path="/seller/offers" element={<P roles={seller}><SellerOffers /></P>} />
           <Route path="/orders" element={<P><BuyerOrders /></P>} />
           <Route path="/seller/orders" element={<P roles={seller}><SellerOrders /></P>} />
           <Route path="/seller/listings" element={<P roles={seller}><SellerListings /></P>} />

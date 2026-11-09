@@ -25,7 +25,7 @@ services:
       PORT: 4000
       DATABASE_URL: postgres://alltinmix:${POSTGRES_PASSWORD}@db:5432/alltinmix
       TRUST_PROXY: "2"   # nginx in the frontend container + your HTTPS proxy in front of it
-    volumes: [uploads:/data/uploads]
+    volumes: [uploads:/data/uploads, private:/data/private]
 
   frontend:
     build: ./frontend
@@ -35,4 +35,5 @@ services:
 
 volumes:
   pgdata:
+  private:
   uploads:

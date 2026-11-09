@@ -47,6 +47,58 @@ function FxRates() {
   );
 }
 
+function DeliveryZones() {
+  const { currency } = useConfig();
+  const toast = useToast();
+  const { data, reload } = useLoad('/admin/settings/delivery-zones');
+  const [rows, setRows] = useState(null);
+  useEffect(() => { if (data) setRows(data.zones.map((z) => ({ name: z.name, fee: String(z.feeMinor / 10 ** currency.decimals) }))); }, [data, currency.decimals]);
+  if (!rows) return <Spinner />;
+  const set = (i, k, v) => setRows((r) => r.map((x, n) => (n === i ? { ...x, [k]: v } : x)));
+  const save = async (e) => {
+    e.preventDefault();
+    try { await api.put('/admin/settings/delivery-zones', { zones: rows.filter((r) => r.name.trim()).map((r) => ({ name: r.name.trim(), feeMinor: Math.round(Number(r.fee || 0) * 10 ** currency.decimals) })) }); toast('Delivery areas saved.'); reload(); }
+    catch (err) { toast(err.message, 'error'); }
+  };
+  return (
+    <form className="card" onSubmit={save}>
+      <h3>Delivery areas and fees</h3>
+      <p className="muted small">Buyers pick an area when they want delivery; the fee is added once per seller and goes to the seller. Leave the list empty if sellers arrange delivery cost themselves. Fees are in {currency.code}.</p>
+      {rows.map((r, i) => (
+        <div className="row" key={i} style={{ marginBottom: 8 }}>
+          <input placeholder="Area name (e.g. Freetown Central)" value={r.name} onChange={(e) => set(i, 'name', e.target.value)} />
+          <input type="number" min="0" step="any" style={{ maxWidth: 140 }} placeholder="Fee" value={r.fee} onChange={(e) => set(i, 'fee', e.target.value)} />
+          <button type="button" className="btn btn-ghost btn-sm" onClick={() => setRows((x) => x.filter((_, n) => n !== i))} aria-label="Remove">✕</button>
+        </div>
+      ))}
+      <div className="row"><button type="button" className="btn btn-ghost btn-sm" onClick={() => setRows((x) => [...x, { name: '', fee: '' }])}>+ Add area</button><button className="btn btn-primary btn-sm">Save</button></div>
+    </form>
+  );
+}
+
+function CodBalances() {
+  const { formatBase: formatMoney, currency } = useConfig();
+  const toast = useToast();
+  const { data, reload } = useLoad('/admin/cod-balances');
+  if (!data) return null;
+  const record = async (s) => {
+    const v = window.prompt(`How much did ${s.name} pay (${currency.code})? They owe ${formatMoney(s.owedMinor)}.`, String(s.owedMinor / 10 ** currency.decimals));
+    if (!v) return;
+    const note = window.prompt('Note (how they paid, reference):', 'Paid platform fees');
+    if (!note) return;
+    try { await api.post(`/admin/users/${s.id}/wallet-adjustment`, { amountMinor: Math.round(Number(v) * 10 ** currency.decimals), note }); toast('Payment recorded.'); reload(); }
+    catch (err) { toast(err.message, 'error'); }
+  };
+  return (
+    <div className="card">
+      <h3>Sellers who owe platform fees (cash on delivery)</h3>
+      {data.sellers.length === 0 ? <p className="muted">Nobody owes anything.</p> : data.sellers.map((s) => (
+        <div className="receipt-row" key={s.id}><span>{s.name}<span className="muted small"> · {s.phone || s.email}</span></span><span className="row"><b>{formatMoney(s.owedMinor)}</b><button className="btn btn-ghost btn-sm" onClick={() => record(s)}>Record payment</button></span></div>
+      ))}
+    </div>
+  );
+}
+
 function Overview() {
   const { formatBase: formatMoney, vertical } = useConfig();
   const toast = useToast();
@@ -76,6 +128,7 @@ function Overview() {
         </div>
       </div>
       <FxRates />
+      <div className="grid grid-2" style={{ alignItems: 'start' }}><DeliveryZones /><CodBalances /></div>
     </div>
   );
 }
@@ -212,6 +265,42 @@ function Listings() {
   );
 }
 
+function Verifications() {
+  const { data, error, reload } = useLoad('/admin/verifications');
+  const run = useAction(reload);
+  const [img, setImg] = useState(null);
+  const toast = useToast();
+  if (!data) return error ? <Alert>{error}</Alert> : <Spinner />;
+  const view = async (s) => {
+    try {
+      const base = import.meta.env.VITE_API_URL || '/api';
+      const res = await fetch(`${base}/admin/verifications/${s.id}/document`, { headers: { Authorization: `Bearer ${localStorage.getItem('marketplace_token')}` } });
+      if (!res.ok) throw new Error('Could not load the photo.');
+      setImg(URL.createObjectURL(await res.blob()));
+    } catch (e) { toast(e.message, 'error'); }
+  };
+  const decide = (s, approve) => {
+    const note = approve ? undefined : window.prompt('Why is it rejected? The seller will see this.');
+    if (!approve && !note) return;
+    run(() => api.post(`/admin/verifications/${s.id}/decide`, { approve, note }), approve ? 'Seller verified.' : 'Rejected.');
+    setImg(null);
+  };
+  return (
+    <>
+      {data.sellers.length === 0 ? <Empty title="Nothing to review">No sellers are waiting for ID verification.</Empty> : (
+        <div className="card table-wrap" style={{ padding: 0 }}><table><thead><tr><th>Seller</th><th>Sent</th><th /></tr></thead><tbody>
+          {data.sellers.map((s) => (
+            <tr key={s.id}><td><b>{s.name}</b><div className="muted small">{s.email}{s.phone ? ` · ${s.phone}` : ''}</div></td><td>{new Date(s.createdAt).toLocaleDateString()}</td>
+              <td className="row"><button className="btn btn-ghost btn-sm" onClick={() => view(s)}>View ID</button>
+                <button className="btn btn-primary btn-sm" onClick={() => decide(s, true)}>Approve</button>
+                <button className="btn btn-ghost btn-sm" onClick={() => decide(s, false)}>Reject</button></td></tr>))}
+        </tbody></table></div>
+      )}
+      {img && <div className="card" style={{ marginTop: 12 }}><img src={img} alt="Seller ID" style={{ maxWidth: '100%', maxHeight: 420 }} /><div><button className="btn btn-ghost btn-sm" onClick={() => { URL.revokeObjectURL(img); setImg(null); }}>Hide photo</button></div></div>}
+    </>
+  );
+}
+
 function Reports() {
   const [status, setStatus] = useState('open');
   const { data, error, reload } = useLoad(`/admin/reports?status=${status}`);
@@ -245,9 +334,9 @@ export function Admin() {
   const badge = (n) => (n > 0 ? <span className="badge" style={{ marginLeft: 6 }}>{n}</span> : null);
   const tabs = [
     ['overview', 'Overview'], ['payments', <>Payments to confirm{badge(data?.paymentsToConfirm)}</>], ['disputes', <>Disputes{badge(data?.openDisputes)}</>],
-    ['payouts', <>Withdrawals{badge(data?.payoutsRequested)}</>], ['refunds', <>Refunds due{badge(data?.refundsDue)}</>], ['users', 'Users'], ['listings', 'Listings'], ['reports', <>Reports{badge(data?.reportsOpen)}</>],
+    ['payouts', <>Withdrawals{badge(data?.payoutsRequested)}</>], ['refunds', <>Refunds due{badge(data?.refundsDue)}</>], ['users', 'Users'], ['listings', 'Listings'], ['reports', <>Reports{badge(data?.reportsOpen)}</>], ['verification', 'Seller ID'],
   ];
-  const View = { overview: Overview, payments: Payments, disputes: Disputes, payouts: Payouts, refunds: Refunds, users: Users, listings: Listings, reports: Reports }[tab];
+  const View = { overview: Overview, payments: Payments, disputes: Disputes, payouts: Payouts, refunds: Refunds, users: Users, listings: Listings, reports: Reports, verification: Verifications }[tab];
   return (
     <div className="container page">
       <h1>Admin</h1>

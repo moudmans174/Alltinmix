@@ -1,7 +1,7 @@
 const express = require('express');
 const db = require('../db');
 const config = require('../config');
-const { getCommissionPct, getRates } = require('../services/orders');
+const { getCommissionPct, getRates, getDeliveryZones } = require('../services/orders');
 const { publicMethods } = require('../payments');
 
 const router = express.Router();
@@ -24,6 +24,7 @@ router.get('/config', async (req, res) => {
     autoCompleteDays: config.autoCompleteDays,
     minPayoutMinor: config.minPayoutMinor,
     allowDigital: config.allowDigital,
+    delivery: { zones: await getDeliveryZones(), codEnabled: config.cod.enabled, smsEnabled: config.sms.provider !== 'none' },
   });
 });
 

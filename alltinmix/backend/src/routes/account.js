@@ -39,7 +39,7 @@ async function walletSummary(userId, q = db) {
     [userId]
   );
   const r = rows[0];
-  return { availableMinor: r.available, pendingMinor: r.pending, withdrawnMinor: r.withdrawn, lifetimeEarnedMinor: r.lifetime };
+  return { availableMinor: r.available, owedMinor: Number(r.available) < 0 ? -r.available : 0, pendingMinor: r.pending, withdrawnMinor: r.withdrawn, lifetimeEarnedMinor: r.lifetime };
 }
 
 router.get('/wallet', async (req, res) => {

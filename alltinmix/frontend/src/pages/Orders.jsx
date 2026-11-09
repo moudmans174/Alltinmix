@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { Download } from 'lucide-react';
+import { Download, MapPin, MessageCircle, Phone, Store } from 'lucide-react';
 import { api, assetUrl, qs } from '../api';
 import { useConfig, useToast } from '../context';
 import { Alert, Empty, Field, Receipt, Spinner, Stars, StatusPill } from '../components/ui';
@@ -40,13 +40,15 @@ function DisputeModal({ order, onClose, onDone }) {
 }
 
 function ReviewModal({ order, onClose, onDone }) {
+  const [photos, setPhotos] = useState([]);
+  const [uploading, setUploading] = useState(false);
   const [rating, setRating] = useState(5);
   const [comment, setComment] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const submit = async (e) => {
     e.preventDefault(); setBusy(true); setError('');
-    try { await api.post(`/orders/${order.id}/review`, { rating, comment }); onDone('Thanks for your review!'); }
+    try { await api.post(`/orders/${order.id}/review`, { rating, comment, images: photos }); onDone('Thanks for your review!'); }
     catch (err) { setError(err.message); setBusy(false); }
   };
   return (
@@ -55,13 +57,61 @@ function ReviewModal({ order, onClose, onDone }) {
         <Alert>{error}</Alert>
         <div style={{ marginBottom: 12 }}><Stars value={rating} onChange={setRating} size={30} /></div>
         <Field label="Comment (optional)"><textarea value={comment} onChange={(e) => setComment(e.target.value)} maxLength={1000} /></Field>
-        <div className="row"><button className="btn btn-primary" disabled={busy}>Submit review</button><button type="button" className="btn btn-ghost" onClick={onClose}>Cancel</button></div>
+        <div style={{ marginBottom: 12 }}>
+          <div className="row" style={{ flexWrap: 'wrap' }}>
+            {photos.map((src) => <img key={src} src={assetUrl(src)} alt="" style={{ width: 64, height: 64, objectFit: 'cover', borderRadius: 8 }} />)}
+            {photos.length < 3 && <label className="btn btn-ghost btn-sm" style={{ cursor: 'pointer' }}>{uploading ? 'Uploading…' : '+ Add photos'}
+              <input type="file" accept="image/jpeg,image/png,image/webp" multiple hidden disabled={uploading} onChange={async (e) => {
+                setUploading(true); setError('');
+                try { const d = await api.upload([...e.target.files].slice(0, 3 - photos.length), '/uploads/review'); setPhotos((p) => [...p, ...d.urls].slice(0, 3)); } catch (err) { setError(err.message); }
+                setUploading(false); e.target.value = '';
+              }} /></label>}
+          </div>
+        </div>
+        <div className="row"><button className="btn btn-primary" disabled={busy || uploading}>Submit review</button><button type="button" className="btn btn-ghost" onClick={onClose}>Cancel</button></div>
       </form>
     </Modal>
   );
 }
 
+/** WhatsApp click-to-chat link (works without any API). The number must include the country code. */
+const waLink = (phone, text) => `https://wa.me/${String(phone || '').replace(/\D/g, '')}?text=${encodeURIComponent(text)}`;
+
+function DeliveryInfo({ o, seller }) {
+  if (!o.deliveryMethod) return null;
+  const a = o.deliveryAddress || {};
+  const contact = seller ? (o.buyerPhone || a.phone) : o.sellerPhone;
+  const who = seller ? (a.name || o.buyerName) : o.sellerName;
+  return (
+    <div className="receipt" style={{ margin: '10px 0' }}>
+      <div className="receipt-row"><span>{o.deliveryMethod === 'pickup' ? <><Store size={14} /> Pickup</> : <><MapPin size={14} /> Delivery{o.deliveryZone ? ` · ${o.deliveryZone}` : ''}</>}</span><b style={{ textAlign: 'right' }}>{o.deliveryMethod === 'ship' ? a.address : (a.pickupLocation || 'Seller will confirm the place')}</b></div>
+      {seller && a.phone && <div className="receipt-row"><span>Buyer phone</span><b>{a.phone}</b></div>}
+      {a.note && <div className="receipt-row"><span>Note</span><b style={{ textAlign: 'right' }}>{a.note}</b></div>}
+      {contact && <div className="row" style={{ marginTop: 8 }}>
+        <a className="btn btn-ghost btn-sm" href={`tel:${contact}`}><Phone size={14} /> Call {who}</a>
+        <a className="btn btn-ghost btn-sm" href={waLink(contact, `Hello, about my order "${o.title}" on ALLTINMIX.`)} target="_blank" rel="noopener noreferrer"><MessageCircle size={14} /> WhatsApp</a>
+      </div>}
+    </div>
+  );
+}
+
+const STEP_LABELS = {
+  awaiting_payment: 'Order created, waiting for payment', pending_acceptance: 'Waiting for the seller to accept', in_progress: 'Seller accepted and is preparing it',
+  delivered: 'Delivered', completed: 'Completed', disputed: 'Problem reported', refunded: 'Refunded', cancelled: 'Cancelled',
+};
+function Timeline({ id }) {
+  const [events, setEvents] = useState(null);
+  useEffect(() => { api.get(`/orders/${id}/events`).then((d) => setEvents(d.events)).catch(() => setEvents([])); }, [id]);
+  if (!events) return <Spinner />;
+  return (
+    <ol className="timeline">
+      {events.map((e, i) => <li key={i} className={i === events.length - 1 ? 'now' : ''}><b>{STEP_LABELS[e.status] || e.status}</b><span className="muted small">{new Date(e.at).toLocaleString()}</span></li>)}
+    </ol>
+  );
+}
+
 function OrderCard({ o, seller, act }) {
+  const [track, setTrack] = useState(false);
   const { formatBase: formatMoney, formatIn } = useConfig();
   const [modal, setModal] = useState(null);
   const [busy, setBusy] = useState('');
@@ -78,16 +128,21 @@ function OrderCard({ o, seller, act }) {
   return (
     <div className="order">
       <div className="row between">
-        <div><b>{o.title}</b> <span className="muted small">× {o.qty}</span><div className="muted small">{seller ? `Buyer: ${o.buyerName}` : `Seller: ${o.sellerName}`} · {new Date(o.createdAt).toLocaleDateString()}{o.paymentMethod ? ` · ${o.paymentMethod.replace('_', ' ')}` : ''}</div></div>
-        <StatusPill status={o.status} />
+        <div><b>{o.title}</b> <span className="muted small">× {o.qty}</span><div className="muted small">{seller ? `Buyer: ${o.buyerName}` : `Seller: ${o.sellerName}`} · {new Date(o.createdAt).toLocaleDateString()}{o.paymentMethod ? ` · ${o.paymentMethod === 'cod' ? 'cash on delivery' : o.paymentMethod.replace('_', ' ')}` : ''}</div></div>
+        <div className="row" style={{ gap: 6 }}>{o.cod && <span className="pill pill-blue" title="Pay the seller in cash on delivery">Cash on delivery</span>}<StatusPill status={o.status} /></div>
       </div>
       {seller ? (
-        <div style={{ margin: '12px 0', maxWidth: 360 }}><Receipt rows={[['Sale', formatMoney(o.totalMinor)], [`Platform fee (${o.commissionPct}%)`, `− ${formatMoney(o.commissionMinor)}`, true]]} total={['You receive', formatMoney(o.sellerEarningsMinor)]} /></div>
+        <div style={{ margin: '12px 0', maxWidth: 360 }}><Receipt rows={[['Sale', formatMoney(o.totalMinor - (o.deliveryFeeMinor || 0))], ...(o.deliveryFeeMinor ? [['Delivery fee (yours)', formatMoney(o.deliveryFeeMinor)]] : []), [`Platform fee (${o.commissionPct}%)`, `− ${formatMoney(o.commissionMinor)}`, true]]} total={[o.cod ? 'Cash to collect' : 'You receive', o.cod ? formatMoney(o.totalMinor) : formatMoney(o.sellerEarningsMinor)]} /></div>
       ) : <p style={{ margin: '8px 0' }}><b>{formatMoney(o.totalMinor)}</b>{o.paidCurrency && o.paidCurrency !== o.currency && <span className="muted small"> · you paid {formatIn(o.paidMinor, o.paidCurrency)}</span>}</p>}
+      {o.cod && seller && <Alert kind="info">Collect {formatMoney(o.totalMinor)} in cash. The platform fee of {formatMoney(o.commissionMinor)} is deducted from your balance when the order completes.</Alert>}
+      {o.cod && !seller && ['pending_acceptance', 'in_progress'].includes(o.status) && <Alert kind="info">Have {formatMoney(o.totalMinor)} in cash ready for when it arrives.</Alert>}
+      <DeliveryInfo o={o} seller={seller} />
       {o.status === 'disputed' && <Alert kind="info">Dispute: {o.disputeReason}. Our team is reviewing.</Alert>}
       {o.status === 'refunded' && o.refundManual && !o.refundSettledAt && !seller && <Alert kind="info">Your refund is being sent by the marketplace to the number you paid from.</Alert>}
       {!seller && o.downloadUrl && <a className="btn btn-accent btn-sm" href={assetUrl(o.downloadUrl)} target="_blank" rel="noopener noreferrer"><Download size={14} /> Download</a>}
+      {track && <Timeline id={o.id} />}
       <div className="row" style={{ marginTop: 10 }}>
+        <button className="btn btn-ghost btn-sm" onClick={() => setTrack(!track)}>{track ? 'Hide timeline' : 'Track order'}</button>
         {seller && o.status === 'pending_acceptance' && <>{btn('accept', 'Accept order')}{btn('cancel', 'Decline & refund', 'btn-ghost', 'Decline this order? The buyer will be refunded.')}</>}
         {seller && o.status === 'in_progress' && <>{btn('deliver', digital ? 'Mark delivered' : 'Mark as shipped / delivered')}{btn('cancel', 'Cancel & refund', 'btn-ghost', 'Cancel this order? The buyer will be refunded.')}</>}
         {!seller && o.status === 'pending_acceptance' && btn('cancel', 'Cancel order', 'btn-ghost', 'Cancel this order and get a refund?')}

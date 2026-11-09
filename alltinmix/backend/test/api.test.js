@@ -7,8 +7,11 @@ const path = require('node:path');
 process.env.NODE_ENV = 'test';
 process.env.DATABASE_URL = process.env.TEST_DATABASE_URL || process.env.DATABASE_URL || 'postgres://postgres@localhost:55432/tally_test';
 process.env.UPLOAD_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'tally-uploads-'));
+process.env.PRIVATE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'tally-private-'));
 process.env.REQUIRE_EMAIL_VERIFICATION = 'true';
 process.env.PAYMENT_PROVIDERS = 'mock,momo,paypal,stripe';
+process.env.COD_ENABLED = 'true';
+process.env.DELIVERY_ZONES = 'Central:20,East:30';
 process.env.STRIPE_SECRET_KEY = 'sk_test_dummy';
 process.env.STRIPE_WEBHOOK_SECRET = 'whsec_test_secret';
 process.env.PAYPAL_CLIENT_ID = 'pp_id';
@@ -40,6 +43,9 @@ const uniq = (s) => `${s.toLowerCase().replace(/[^a-z0-9]/g, '')}${Date.now().to
 const api = (method, url, token, body) => {
   const r = request(app)[method](url);
   if (token) r.set('Authorization', `Bearer ${token}`);
+  // Physical items need delivery details; give checkout calls a default unless the test sets its own (or `delivery: false`).
+  if (body && url === '/api/orders/checkout' && body.delivery === undefined) body = { ...body, delivery: { method: 'pickup', phone: '+23277000111' } };
+  if (body && body.delivery === false) { body = { ...body }; delete body.delivery; }
   return body === undefined ? r : r.send(body);
 };
 
@@ -106,6 +112,7 @@ describe('ALLTINMIX marketplace API', () => {
   after(async () => {
     await db.pool.end();
     fs.rmSync(process.env.UPLOAD_DIR, { recursive: true, force: true });
+    fs.rmSync(process.env.PRIVATE_DIR, { recursive: true, force: true });
   });
 
   // ---------------------------------------------------------------- config & security
@@ -115,7 +122,9 @@ describe('ALLTINMIX marketplace API', () => {
     assert.equal(r.status, 200);
     assert.deepEqual(r.body.verticals.map((v) => v.key), ['product', 'service', 'property', 'vehicle']);
     const keys = r.body.paymentMethods.map((m) => m.key).sort();
-    assert.deepEqual(keys, ['afrimoney', 'card', 'orange_money', 'paypal', 'qmoney', 'test']);
+    assert.deepEqual(keys, ['afrimoney', 'card', 'cod', 'orange_money', 'paypal', 'qmoney', 'test']);
+    assert.equal(r.body.delivery.codEnabled, true);
+    assert.deepEqual(r.body.delivery.zones, [{ name: 'Central', feeMinor: 2000 }, { name: 'East', feeMinor: 3000 }]);
     assert.ok(!JSON.stringify(r.body).includes('sk_test_dummy'), 'no secrets in public config');
     assert.ok(!JSON.stringify(r.body).includes('+23277000001'), 'merchant wallet numbers are not public');
     assert.ok(r.body.brand.name);
@@ -732,5 +741,277 @@ describe('ALLTINMIX marketplace API', () => {
     assert.equal((await db.query('SELECT name, status FROM users WHERE id = $1', [buy1.id])).rows[0].status, 'deleted');
     // The email can be used to sign up again
     assert.equal((await api('post', '/api/auth/register', null, { name: 'Dee Again', email: buy1.email, password: PASSWORD, role: 'buyer' })).status, 201);
+  });
+
+  test('local delivery: zones and fees, pickup, cash on delivery, seller owes the platform fee', async () => {
+    const sel = await register('seller', 'Cash Seller');
+    const buyr = await register('buyer', 'Cash Buyer');
+    const l = await mkListing(sel.token, { title: 'Phone Case', price: 100, stock: 10 });
+    const item = [{ listingId: l.id, qty: 2 }];
+
+    // Physical goods need delivery details
+    const none = await api('post', '/api/orders/checkout', buyr.token, { items: item, method: 'test', delivery: false });
+    assert.equal(none.body.code, 'DELIVERY_REQUIRED');
+    const noZone = await api('post', '/api/orders/checkout', buyr.token, { items: item, method: 'test', delivery: { method: 'ship', phone: '+23277000222', address: '12 Main Street' } });
+    assert.equal(noZone.body.code, 'DELIVERY_ZONE');
+    const noAddr = await api('post', '/api/orders/checkout', buyr.token, { items: item, method: 'test', delivery: { method: 'ship', zone: 'Central', phone: '+23277000222', address: '' } });
+    assert.equal(noAddr.body.code, 'DELIVERY_ADDRESS');
+
+    // Delivery fee is added to the order, goes entirely to the seller, and commission is only on the goods
+    const ship = await api('post', '/api/orders/checkout', buyr.token, { items: item, method: 'cod', delivery: { method: 'ship', zone: 'East', name: 'Cash Buyer', phone: '+23277000222', address: '12 Main Street, Wellington' } });
+    assert.equal(ship.status, 201, JSON.stringify(ship.body));
+    assert.equal(ship.body.kind, 'cod');
+    const o = (await db.query('SELECT * FROM orders WHERE payment_id = $1', [ship.body.paymentId])).rows[0];
+    assert.equal(Number(o.total_minor), 2 * 10000 + 3000, 'items plus the East fee');
+    assert.equal(o.status, 'pending_acceptance', 'cash on delivery skips the payment wait');
+    assert.equal(Number(o.delivery_fee_minor), 3000);
+    assert.equal(Number(o.commission_minor), Math.round(2 * 10000 * Number(o.commission_pct) / 100));
+    assert.equal(Number(o.seller_earnings_minor), 2 * 10000 - Number(o.commission_minor) + 3000);
+    assert.equal(o.delivery_address.address, '12 Main Street, Wellington');
+    assert.equal((await db.query('SELECT stock FROM listings WHERE id = $1', [l.id])).rows[0].stock, 8);
+
+    // Seller sees where to deliver; the buyer sees the seller's contact
+    const sOrders = await api('get', '/api/orders/selling', sel.token);
+    assert.equal(sOrders.body.orders[0].deliveryAddress.phone, '+23277000222');
+    assert.equal(sOrders.body.orders[0].cod, true);
+
+    // Cannot mix COD with a download
+    const dl = await mkListing(sel.token, { type: 'product', category: 'Digital Downloads', title: 'Guide', price: 5, fulfillment: 'digital', deliveryUrl: 'https://files.test/guide.pdf', stock: undefined });
+    const mix = await api('post', '/api/orders/checkout', buyr.token, { items: [{ listingId: dl.id, qty: 1 }], method: 'cod' });
+    assert.equal(mix.body.code, 'COD_NOT_AVAILABLE');
+
+    // Run the order: accept, deliver (cash collected), buyer confirms. No earning credit; only the platform fee is charged.
+    assert.equal((await api('post', `/api/orders/${o.id}/accept`, sel.token)).status, 200);
+    assert.equal((await api('post', `/api/orders/${o.id}/deliver`, sel.token)).status, 200);
+    assert.equal((await api('post', `/api/orders/${o.id}/confirm`, buyr.token)).status, 200);
+    const w = await api('get', '/api/account/wallet', sel.token);
+    assert.equal(Number(w.body.wallet.availableMinor), -Number(o.commission_minor));
+    assert.equal(Number(w.body.wallet.owedMinor), Number(o.commission_minor));
+    const owed = await api('get', '/api/admin/cod-balances', admin.token);
+    assert.ok(owed.body.sellers.some((x) => x.id === sel.id && x.owedMinor === Number(o.commission_minor)));
+    assert.equal((await api('delete', '/api/account', sel.token, { password: PASSWORD })).status, 409, 'cannot delete an account that owes money');
+
+    // The admin records the seller paying what they owe
+    const adj = await api('post', `/api/admin/users/${sel.id}/wallet-adjustment`, admin.token, { amountMinor: Number(o.commission_minor), note: 'Paid by Orange Money' });
+    assert.equal(adj.status, 200);
+    assert.equal(Number((await api('get', '/api/account/wallet', sel.token)).body.wallet.availableMinor), 0);
+
+    // Pickup: no fee, the pickup location is remembered
+    const pick = await api('post', '/api/orders/checkout', buyr.token, { items: [{ listingId: l.id, qty: 1 }], method: 'cod', delivery: { method: 'pickup', phone: '+23277000222' } });
+    assert.equal(pick.status, 201);
+    const po = (await db.query('SELECT * FROM orders WHERE payment_id = $1', [pick.body.paymentId])).rows[0];
+    assert.equal(Number(po.delivery_fee_minor), 0);
+    assert.equal(po.delivery_method, 'pickup');
+
+    // Cancelling a COD order returns the stock and needs no refund
+    assert.equal((await api('post', `/api/orders/${po.id}/cancel`, buyr.token)).status, 200);
+    assert.equal((await db.query('SELECT stock FROM listings WHERE id = $1', [l.id])).rows[0].stock, 8);
+
+    // A seller who owes too much cannot take more COD orders
+    await db.query("INSERT INTO wallet_entries (user_id, kind, amount_minor, note) VALUES ($1,'adjustment',-99999999,'test debt')", [sel.id]);
+    const blocked = await api('post', '/api/orders/checkout', buyr.token, { items: item, method: 'cod', delivery: { method: 'pickup', phone: '+23277000222' } });
+    assert.equal(blocked.body.code, 'COD_SELLER_BLOCKED');
+
+    // Admin edits the delivery zones
+    const z = await api('put', '/api/admin/settings/delivery-zones', admin.token, { zones: [{ name: 'Bo', feeMinor: 500 }] });
+    assert.equal(z.status, 200);
+    assert.deepEqual((await api('get', '/api/config')).body.delivery.zones, [{ name: 'Bo', feeMinor: 500 }]);
+    assert.equal((await api('put', '/api/admin/settings/delivery-zones', buyr.token, { zones: [] })).status, 403);
+  });
+
+  test('SMS alerts go through an outbox and a pluggable gateway', async () => {
+    const { normalizePhone, enqueueSms, processSmsOutbox } = require('../src/lib/sms');
+    const config = require('../src/config');
+    assert.equal(normalizePhone('+232 77 000 111'), '+23277000111');
+    assert.equal(normalizePhone('077000111'), null, 'no country code configured, so a local number is refused');
+    config.sms.countryCode = '232';
+    assert.equal(normalizePhone('077000111'), '+23277000111');
+    assert.equal(normalizePhone('12'), null);
+    config.sms.provider = 'webhook';
+    config.sms.webhookUrl = 'https://sms.test/send';
+    const calls = [];
+    const realFetch = global.fetch;
+    global.fetch = async (url, init) => { calls.push({ url, body: JSON.parse(init.body) }); return { ok: true, text: async () => '' }; };
+    try {
+      assert.equal(await enqueueSms(db, { phone: '077000111', body: 'Hello' }), true);
+      assert.equal(await processSmsOutbox(), 1);
+    } finally { global.fetch = realFetch; config.sms.provider = 'none'; config.sms.countryCode = ''; }
+    assert.deepEqual(calls[0].body, { to: '+23277000111', message: 'Hello', channel: 'sms' });
+    assert.equal(await enqueueSms(db, { phone: '077000111', body: 'x' }), false, 'nothing queued when SMS is off');
+  });
+
+  test('buyer features: wishlist, offers and counter-offers, order timeline, photo reviews', async () => {
+    const sel = await register('seller', 'Haggle Seller');
+    const buyr = await register('buyer', 'Haggle Buyer');
+    const l = await mkListing(sel.token, { title: 'Used Laptop', price: 1000, stock: 3 });
+
+    // Wishlist
+    assert.equal((await api('post', '/api/wishlist', null, { listingId: l.id })).status, 401);
+    assert.equal((await api('post', '/api/wishlist', buyr.token, { listingId: l.id })).status, 201);
+    assert.equal((await api('post', '/api/wishlist', buyr.token, { listingId: l.id })).status, 201, 'saving twice is harmless');
+    assert.deepEqual((await api('get', '/api/wishlist/ids', buyr.token)).body.ids, [l.id]);
+    assert.equal((await api('get', '/api/wishlist', buyr.token)).body.listings[0].title, 'Used Laptop');
+    assert.equal((await api('delete', `/api/wishlist/${l.id}`, buyr.token)).status, 200);
+    assert.equal((await api('get', '/api/wishlist/ids', buyr.token)).body.ids.length, 0);
+
+    // Offers: validation
+    const offer = (amount, extra = {}) => api('post', '/api/offers', buyr.token, { listingId: l.id, amount, ...extra });
+    assert.equal((await offer(1000)).body.code, 'OFFER_TOO_HIGH');
+    assert.equal((await offer(100)).body.code, 'OFFER_TOO_LOW');
+    assert.equal((await api('post', '/api/offers', sel.token, { listingId: l.id, amount: 800 })).status, 400, 'not on your own listing');
+    const made = await offer(700, { qty: 2, message: 'Can you do 700?' });
+    assert.equal(made.status, 201, JSON.stringify(made.body));
+    assert.equal((await offer(750)).body.code, 'OFFER_EXISTS');
+
+    // Seller counters, buyer accepts the counter
+    assert.equal((await api('post', `/api/offers/${made.body.id}/respond`, buyr.token, { action: 'accept' })).status, 404, 'only the seller can respond');
+    assert.equal((await api('post', `/api/offers/${made.body.id}/respond`, sel.token, { action: 'counter', counter: 600 })).body.code, 'BAD_COUNTER');
+    assert.equal((await api('post', `/api/offers/${made.body.id}/respond`, sel.token, { action: 'counter', counter: 850 })).status, 200);
+    const mine = await api('get', '/api/offers/mine', buyr.token);
+    assert.equal(mine.body.offers[0].status, 'countered');
+    assert.equal((await api('post', `/api/offers/${made.body.id}/buyer`, buyr.token, { action: 'accept' })).status, 200);
+    assert.equal(Number((await db.query('SELECT agreed_minor FROM offers WHERE id = $1', [made.body.id])).rows[0].agreed_minor), 85000);
+
+    // Checking out with the offer uses the agreed price and quantity, once
+    const pay = await api('post', '/api/orders/checkout', buyr.token, { items: [{ listingId: l.id, qty: 1, offerId: made.body.id }], method: 'test', delivery: { method: 'pickup', phone: '+23277000333' } });
+    assert.equal(pay.status, 201, JSON.stringify(pay.body));
+    const ord = (await db.query('SELECT * FROM orders WHERE payment_id = $1', [pay.body.paymentId])).rows[0];
+    assert.equal(ord.qty, 2);
+    assert.equal(Number(ord.unit_price_minor), 85000);
+    assert.equal(Number(ord.total_minor), 170000);
+    assert.equal((await db.query('SELECT status FROM offers WHERE id = $1', [made.body.id])).rows[0].status, 'used');
+    const reuse = await api('post', '/api/orders/checkout', buyr.token, { items: [{ listingId: l.id, qty: 1, offerId: made.body.id }], method: 'test', delivery: { method: 'pickup', phone: '+23277000333' } });
+    assert.equal(reuse.body.code, 'OFFER_INVALID');
+    const stranger2 = await register('buyer', 'Other Buyer');
+    assert.equal((await api('post', '/api/orders/checkout', stranger2.token, { items: [{ listingId: l.id, qty: 1, offerId: made.body.id }], method: 'test', delivery: { method: 'pickup', phone: '+23277000333' } })).body.code, 'OFFER_INVALID');
+
+    // An unpaid checkout hands the agreed price back
+    const orders = require('../src/services/orders');
+    await orders.failPayment(pay.body.paymentId, 'test');
+    assert.equal((await db.query('SELECT status FROM offers WHERE id = $1', [made.body.id])).rows[0].status, 'accepted');
+
+    // Decline and withdraw paths
+    const other = await mkListing(sel.token, { title: 'Old Phone', price: 400, stock: 1 });
+    const o2 = await api('post', '/api/offers', buyr.token, { listingId: other.id, amount: 250 });
+    assert.equal((await api('post', `/api/offers/${o2.body.id}/respond`, sel.token, { action: 'decline' })).status, 200);
+    assert.equal((await api('post', `/api/offers/${o2.body.id}/buyer`, buyr.token, { action: 'withdraw' })).status, 409, 'closed offers cannot be changed');
+    const o3 = await api('post', '/api/offers', buyr.token, { listingId: other.id, amount: 300 });
+    assert.equal(o3.status, 201);
+    assert.equal((await api('post', `/api/offers/${o3.body.id}/buyer`, buyr.token, { action: 'withdraw' })).status, 200);
+    assert.equal((await api('get', '/api/offers/received', sel.token)).body.offers.length, 3);
+
+    // Order timeline records every step automatically
+    const b = await buy(buyr, [{ listingId: other.id, qty: 1 }]);
+    const oid = b.orders[0].id;
+    await api('post', `/api/orders/${oid}/accept`, sel.token);
+    await api('post', `/api/orders/${oid}/deliver`, sel.token);
+    await api('post', `/api/orders/${oid}/confirm`, buyr.token);
+    const ev = await api('get', `/api/orders/${oid}/events`, buyr.token);
+    assert.deepEqual(ev.body.events.map((e) => e.status), ['awaiting_payment', 'pending_acceptance', 'in_progress', 'delivered', 'completed']);
+    assert.equal((await api('get', `/api/orders/${oid}/events`, stranger2.token)).status, 404);
+
+    // Review with photos (own uploads only)
+    const png = Buffer.from('89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000d49444154789c6360000002000001e221bc330000000049454e44ae426082', 'hex');
+    const up = await request(app).post('/api/uploads/review').set('Authorization', `Bearer ${buyr.token}`).attach('images', png, { filename: 'a.png', contentType: 'image/png' });
+    assert.equal(up.status, 201, JSON.stringify(up.body));
+    assert.equal((await api('post', `/api/orders/${oid}/review`, buyr.token, { rating: 5, comment: 'Great', images: ['https://evil.test/x.png'] })).status, 400);
+    assert.equal((await api('post', `/api/orders/${oid}/review`, buyr.token, { rating: 5, comment: 'Great', images: up.body.urls })).status, 201);
+    const detail = await api('get', `/api/listings/${other.id}`);
+    assert.deepEqual(detail.body.reviews[0].images, up.body.urls);
+  });
+  test('trust & growth: seller verification, public profile, coupons, promotion, analytics, CSV upload', async () => {
+    const sel = await register('seller', 'Vera Verified');
+    const buyr = await register('buyer', 'Cora Coupon');
+    const png = Buffer.from('89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000d49444154789c6360000002000001e221bc330000000049454e44ae426082', 'hex');
+
+    // verification: the ID goes to a private folder, only an admin can see it, and it is deleted once decided
+    assert.equal((await api('get', '/api/seller/verification', buyr.token)).status, 403);
+    const send = () => request(app).post('/api/seller/verification').set('Authorization', `Bearer ${sel.token}`).attach('document', png, { filename: 'id.png', contentType: 'image/png' });
+    assert.equal((await send()).status, 201);
+    assert.equal((await send()).body.code, 'ALREADY');
+    assert.ok(fs.readdirSync(path.resolve(process.env.PRIVATE_DIR)).length >= 1);
+    const pub = new Set(fs.readdirSync(process.env.UPLOAD_DIR));
+    assert.equal(fs.readdirSync(path.resolve(process.env.PRIVATE_DIR)).some((f) => pub.has(f)), false, 'ID must not be in the public folder');
+    assert.equal((await api('get', `/api/admin/verifications/${sel.id}/document`, sel.token)).status, 403);
+    assert.equal((await api('get', `/api/admin/verifications/${sel.id}/document`, admin.token)).status, 200);
+    assert.equal((await api('post', `/api/admin/verifications/${sel.id}/decide`, admin.token, { approve: false })).status, 400);
+    assert.equal((await api('post', `/api/admin/verifications/${sel.id}/decide`, admin.token, { approve: true })).status, 200);
+    assert.equal((await api('get', `/api/admin/verifications/${sel.id}/document`, admin.token)).status, 404, 'photo removed after decision');
+    assert.equal((await api('get', '/api/seller/verification', sel.token)).body.status, 'approved');
+
+    // verified badge on listings + filter
+    const l = await mkListing(sel.token, { title: 'Verified Radio', price: 100, stock: 10 });
+    const plain = await mkListing((await register('seller', 'Plain Pete')).token, { title: 'Plain Radio', price: 100, stock: 10 });
+    assert.equal((await api('get', `/api/listings/${l.id}`)).body.listing.sellerVerified, true);
+    assert.deepEqual((await api('get', '/api/listings?verified=1&q=Radio')).body.listings.map((x) => x.id), [l.id]);
+    assert.equal((await api('get', '/api/listings?q=Radio')).body.total, 2);
+
+    // public profile
+    const prof = await api('get', `/api/sellers/${sel.id}`);
+    assert.equal(prof.status, 200);
+    assert.equal(prof.body.seller.verified, true);
+    assert.equal(prof.body.listings.length, 1);
+    assert.equal((await api('get', `/api/sellers/${buyr.id}`)).status, 404, 'buyers have no storefront');
+
+    // views are counted for visitors, not for the owner (the first request above already counted one)
+    await api('get', `/api/listings/${l.id}`, sel.token);
+    await new Promise((r) => setTimeout(r, 150));
+    const views = (await db.query('SELECT views FROM listings WHERE id = $1', [l.id])).rows[0].views;
+    assert.equal(views, 1);
+
+    // coupons
+    assert.equal((await api('post', '/api/seller/coupons', sel.token, { code: 'ab', percentOff: 5 })).status, 400);
+    assert.equal((await api('post', '/api/seller/coupons', sel.token, { code: 'both', percentOff: 10, amountOff: 5 })).status, 400);
+    const cp = await api('post', '/api/seller/coupons', sel.token, { code: 'save10', percentOff: 10, maxUses: 1 });
+    assert.equal(cp.status, 201, JSON.stringify(cp.body));
+    assert.equal((await api('post', '/api/seller/coupons', (await register('seller', 'Other S')).token, { code: 'SAVE10', percentOff: 5 })).body.code, 'CODE_TAKEN');
+    const co = (items, code) => api('post', '/api/orders/checkout', buyr.token, { items, method: 'test', couponCode: code });
+    assert.equal((await co([{ listingId: l.id, qty: 1 }], 'nope')).body.code, 'COUPON_INVALID');
+    assert.equal((await co([{ listingId: plain.id, qty: 1 }], 'SAVE10')).body.code, 'COUPON_NOT_APPLICABLE');
+    const paid = await co([{ listingId: l.id, qty: 2 }], 'save10');
+    assert.equal(paid.status, 201, JSON.stringify(paid.body));
+    const o = (await db.query('SELECT * FROM orders WHERE payment_id = $1', [paid.body.paymentId])).rows[0];
+    assert.equal(Number(o.discount_minor), 2000);
+    assert.equal(Number(o.total_minor), 18000 + Number(o.delivery_fee_minor));
+    assert.equal(Number(o.commission_minor), Math.round(18000 * Number(o.commission_pct || 0) / 100) || Number(o.commission_minor));
+    assert.equal((await co([{ listingId: l.id, qty: 1 }], 'SAVE10')).body.code, 'COUPON_EXHAUSTED');
+    await orders.failPayment(paid.body.paymentId, 'test');
+    assert.equal((await db.query('SELECT used_count FROM coupons WHERE id = $1', [cp.body.coupon.id])).rows[0].used_count, 0);
+    assert.equal((await co([{ listingId: l.id, qty: 1 }], 'SAVE10')).status, 201);
+    assert.equal((await api('patch', `/api/seller/coupons/${cp.body.coupon.id}`, sel.token, { active: false })).body.coupon.active, false);
+
+    // promotion, paid from the wallet
+    assert.equal((await api('post', `/api/seller/listings/${l.id}/boost`, sel.token)).body.code, 'BOOST_OFF');
+    const cfg = require('../src/config');
+    cfg.boost.priceMinor = 500; cfg.boost.days = 7;
+    try {
+      assert.equal((await api('post', `/api/seller/listings/${l.id}/boost`, sel.token)).body.code, 'INSUFFICIENT_FUNDS');
+      await db.query("INSERT INTO wallet_entries (user_id, kind, amount_minor, note) VALUES ($1,'adjustment',2000,'top up')", [sel.id]);
+      assert.equal((await api('post', `/api/seller/listings/${l.id}/boost`, sel.token)).status, 200);
+      assert.equal((await api('post', `/api/seller/listings/${plain.id}/boost`, sel.token)).status, 404, 'not your listing');
+      assert.equal(Number((await db.query('SELECT sum(amount_minor) AS s FROM wallet_entries WHERE user_id = $1', [sel.id])).rows[0].s), 1500);
+      const feed = await api('get', '/api/listings?q=Radio');
+      assert.equal(feed.body.listings[0].id, l.id);
+      assert.equal(feed.body.listings[0].promoted, true);
+    } finally { cfg.boost.priceMinor = 0; }
+
+    // analytics
+    const an = await api('get', '/api/seller/analytics', sel.token);
+    assert.equal(an.status, 200);
+    assert.equal(an.body.views, 1);
+    assert.equal(an.body.daily.length, 14);
+    assert.equal(an.body.topListings[0].id, l.id);
+
+    // CSV bulk upload
+    const csv = 'type,category,title,description,price,stock\nproduct,Electronics,"Speaker, small","Loud ""one""",20,3\nproduct,Nonsense,Bad cat,,5,1\nproduct,Electronics,No stock,,9,\n';
+    const bulk = await api('post', '/api/seller/listings/bulk', sel.token, { csv });
+    assert.equal(bulk.status, 201, JSON.stringify(bulk.body));
+    assert.equal(bulk.body.created, 1);
+    assert.deepEqual(bulk.body.errors.map((e) => e.row), [3, 4]);
+    const sp = (await db.query("SELECT title, description FROM listings WHERE seller_id = $1 AND title LIKE 'Speaker%'", [sel.id])).rows[0];
+    assert.equal(sp.title, 'Speaker, small');
+    assert.equal(sp.description, 'Loud "one"');
+    assert.equal((await api('post', '/api/seller/listings/bulk', sel.token, { csv: 'title\nx' })).body.code, 'BAD_CSV');
+    assert.equal((await api('post', '/api/seller/listings/bulk', buyr.token, { csv })).status, 403);
   });
 });

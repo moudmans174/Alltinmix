@@ -1,26 +1,49 @@
 import React, { useEffect, useState } from 'react';
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
-import { Flag, MapPin, Share2, Star } from 'lucide-react';
+import { Flag, Heart, MapPin, Share2, Star } from 'lucide-react';
 import { ReportModal } from '../components/Report';
 import { shareLink } from '../native';
 import { api, assetUrl, qs } from '../api';
-import { useAuth, useCart, useConfig, useToast } from '../context';
+import { useAuth, useCart, useConfig, useTheme, useToast, useWishlist } from '../context';
+import { getRecent, pushRecent } from '../recent';
+import { OfferModal } from './Buyer';
 import { Icon, categoryIconName } from '../icons';
-import { Alert, Empty, Field, ImageGallery, Pagination, Spinner, Stars, attributeSummary } from '../components/ui';
+import { Alert, Empty, Field, ImageGallery, Pagination, Spinner, Stars, VerifiedBadge, attributeSummary } from '../components/ui';
+
+import { registerShop } from './Buyer';
+
+export function HeartButton({ id, className = 'heart' }) {
+  const { has, toggle } = useWishlist();
+  const toast = useToast();
+  const nav = useNavigate();
+  const saved = has(id);
+  return (
+    <button type="button" className={`${className} ${saved ? 'on' : ''}`} aria-pressed={saved} aria-label={saved ? 'Remove from wishlist' : 'Save to wishlist'}
+      onClick={async (e) => {
+        e.preventDefault(); e.stopPropagation();
+        const r = await toggle(id);
+        if (r === null) { toast('Log in to save items.', 'error'); nav('/login'); } else toast(r ? 'Saved to your wishlist.' : 'Removed from your wishlist.');
+      }}><Heart size={18} fill={saved ? 'currentColor' : 'none'} /></button>
+  );
+}
 
 export function ListingCard({ l }) {
   const { formatMoney, vertical } = useConfig();
+  const { lowData } = useTheme();
   const v = vertical(l.type);
   const summary = attributeSummary(l, v, 3);
   return (
     <Link to={`/listing/${l.id}`} className="listing-card">
       <div className="thumb">
-        {l.images?.[0] ? <img src={assetUrl(l.images[0])} alt="" loading="lazy" /> : <span className="thumb-empty"><Icon name={categoryIconName(v, l.category)} size={56} strokeWidth={1.25} /></span>}
+        {l.images?.[0] && !lowData ? <img src={assetUrl(l.images[0])} alt="" loading="lazy" /> : <span className="thumb-empty"><Icon name={categoryIconName(v, l.category)} size={56} strokeWidth={1.25} /></span>}
         <span className="tag"><Icon name={v?.icon} size={12} /> {v?.label || l.type}</span>
+        <HeartButton id={l.id} />
+        {l.promoted && <span className="tag tag-sponsored">Sponsored</span>}
       </div>
       <div className="body">
         <span className="title">{l.title}</span>
         <span className="price">{formatMoney(l.priceMinor)}{v?.commerce === 'service' ? <small className="muted"> / order</small> : ''}</span>
+        {l.sellerVerified && <span className="small"><VerifiedBadge /></span>}
         {summary && <span className="muted small">{summary}</span>}
         <span className="muted small row" style={{ gap: 6, marginTop: 'auto' }}>
           {l.location && <><MapPin size={12} />{l.location}</>}
@@ -34,6 +57,7 @@ export function ListingCard({ l }) {
 export function Home() {
   const { brand, verticals } = useConfig();
   const [items, setItems] = useState(null);
+  const [recent] = useState(getRecent);
   useEffect(() => { api.get('/listings?limit=8&sort=popular').then((d) => setItems(d.listings)).catch(() => setItems([])); }, []);
   return (
     <>
@@ -49,6 +73,7 @@ export function Home() {
             <Link key={v.key} className="tile" to={`/browse?type=${v.key}`}><span className="tile-icon"><Icon name={v.icon} size={26} /></span><b>{v.label}</b><span className="muted small">{v.categories.slice(0, 3).join(', ')}…</span></Link>
           ))}
         </div>
+        {recent.length > 0 && <><h2 style={{ marginTop: 32 }}>Recently viewed</h2><div className="grid grid-listings">{recent.slice(0, 4).map((l) => <ListingCard key={l.id} l={l} />)}</div></>}
         <h2 style={{ marginTop: 32 }}>Popular right now</h2>
         {items === null ? <Spinner /> : items.length === 0 ? <Empty title="No listings yet">Be the first to post something.</Empty> : <div className="grid grid-listings">{items.map((l) => <ListingCard key={l.id} l={l} />)}</div>}
       </div>
@@ -71,7 +96,7 @@ export function Browse() {
   const query = sp.toString();
   useEffect(() => {
     setData(null); setError('');
-    api.get(`/listings${qs({ q, type, category, sort, page, location: sp.get('location'), minPrice: sp.get('minPrice'), maxPrice: sp.get('maxPrice') })}`)
+    api.get(`/listings${qs({ q, type, category, sort, page, location: sp.get('location'), minPrice: sp.get('minPrice'), maxPrice: sp.get('maxPrice'), verified: sp.get('verified') })}`)
       .then(setData).catch((e) => setError(e.message));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [query]);
@@ -106,6 +131,7 @@ export function Browse() {
             <Field label="Location"><input value={form.location} onChange={(e) => setForm({ ...form, location: e.target.value })} placeholder="e.g. Freetown" /></Field>
             <div className="row"><Field label="Min price"><input type="number" min="0" value={form.minPrice} onChange={(e) => setForm({ ...form, minPrice: e.target.value })} /></Field>
               <Field label="Max price"><input type="number" min="0" value={form.maxPrice} onChange={(e) => setForm({ ...form, maxPrice: e.target.value })} /></Field></div>
+            <label className="row" style={{ gap: 8, marginBottom: 12 }}><input type="checkbox" checked={sp.get('verified') === '1'} onChange={(e) => set({ verified: e.target.checked ? '1' : '' })} /> <span className="small">Verified sellers only</span></label>
             <button className="btn btn-primary btn-block">Apply filters</button>
           </form>
         </aside>
@@ -165,8 +191,9 @@ export function ListingDetail() {
   const [error, setError] = useState('');
   const [qty, setQty] = useState(1);
   const [reporting, setReporting] = useState(false);
+  const [offering, setOffering] = useState(false);
 
-  useEffect(() => { setData(null); api.get(`/listings/${id}`).then(setData).catch((e) => setError(e.message)); }, [id]);
+  useEffect(() => { setData(null); api.get(`/listings/${id}`).then((d) => { pushRecent(d.listing); setData(d); }).catch((e) => setError(e.message)); }, [id]);
   if (error) return <div className="container page"><Empty title="Listing not found">{error}</Empty></div>;
   if (!data) return <Spinner />;
 
@@ -193,15 +220,17 @@ export function ListingDetail() {
               <div key={i} style={{ padding: '10px 0', borderTop: i ? '1px solid var(--line)' : 0 }}>
                 <Stars value={r.rating} size={15} /> <b className="small">{r.reviewer}</b>
                 {r.comment && <p style={{ margin: '4px 0 0' }}>{r.comment}</p>}
+                {r.images?.length > 0 && <div className="review-photos">{r.images.map((src) => <a key={src} href={assetUrl(src)} target="_blank" rel="noopener noreferrer"><img src={assetUrl(src)} alt="Photo from the buyer" loading="lazy" /></a>)}</div>}
               </div>
             ))}
           </div>
         </div>
         <aside className="card stack" style={{ position: 'sticky', top: 80 }}>
           <span className="pill pill-grey row" style={{ alignSelf: 'flex-start', gap: 6, display: 'inline-flex' }}><Icon name={categoryIconName(v, l.category)} size={13} /> {l.category}</span>
-          <h1 style={{ fontSize: '1.6rem', margin: 0 }}>{l.title}</h1>
+          <div className="row between" style={{ alignItems: 'flex-start' }}><h1 style={{ fontSize: '1.6rem', margin: 0 }}>{l.title}</h1><HeartButton id={l.id} className="heart heart-inline" /></div>
           <div className="price" style={{ fontSize: '1.9rem' }}>{formatMoney(l.priceMinor)}</div>
-          <p className="muted small" style={{ margin: 0 }}>Sold by <b>{l.sellerName}</b>{l.sellerTag ? ` · ${l.sellerTag}` : ''}{l.location ? ` · ${l.location}` : ''}</p>
+          <p className="muted small" style={{ margin: 0 }}>Sold by <Link to={`/store/${l.sellerId}`}><b>{l.sellerName}</b></Link> {l.sellerVerified && <VerifiedBadge />}{l.sellerTag ? ` · ${l.sellerTag}` : ''}{l.location ? ` · ${l.location}` : ''}</p>
+          <p className="muted small" style={{ margin: 0 }}><Link to="/protection">Buyer protection</Link> · money held until you confirm</p>
           {l.mode === 'inquiry' ? <InquiryBox listing={l} /> : isOwner ? (
             <div className="stack"><p className="muted">This is your listing.</p><Link className="btn btn-ghost btn-block" to={`/seller/listings/${l.id}/edit`}>Edit listing</Link></div>
           ) : (
@@ -219,15 +248,19 @@ export function ListingDetail() {
                 <div className="stack">
                   <button className="btn btn-accent btn-block" onClick={() => { add(); nav('/cart'); }}>{v?.commerce === 'service' ? 'Order now' : 'Buy now'}</button>
                   <button className="btn btn-ghost btn-block" onClick={add}>Add to cart</button>
+                  {v?.mode === 'checkout' && <button className="btn btn-ghost btn-block" onClick={() => (user ? setOffering(true) : nav('/login'))}>Make an offer</button>}
                 </div>
               )}
             </>
           )}
           <button className="link-btn small" style={{ alignSelf: 'flex-start' }} onClick={async () => (await shareLink({ title: l.title, text: l.title, path: `/listing/${l.id}` })) === 'copied' && toast('Link copied.')}><Share2 size={13} /> Share</button>
           {user && !isOwner && <button className="link-btn small" style={{ alignSelf: 'flex-start' }} onClick={() => setReporting(true)}><Flag size={13} /> Report this listing</button>}
+          {offering && <OfferModal listing={l} qtyHint={qty} onClose={() => setOffering(false)} />}
           {reporting && <ReportModal targetType="listing" targetId={l.id} onClose={() => setReporting(false)} />}
         </aside>
       </div>
     </div>
   );
 }
+
+registerShop({ ListingCard });

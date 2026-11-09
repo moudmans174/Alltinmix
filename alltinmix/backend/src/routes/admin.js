@@ -58,6 +58,36 @@ router.patch('/settings/fx-rates', async (req, res) => {
   res.json({ base: config.baseCurrency, rates: await orders.getRates() });
 });
 
+router.get('/settings/delivery-zones', async (req, res) => {
+  res.json({ zones: await orders.getDeliveryZones() });
+});
+
+router.put('/settings/delivery-zones', async (req, res) => {
+  const body = parse(z.object({ zones: z.array(z.object({ name: z.string().trim().min(1).max(60), feeMinor: z.coerce.number().int().min(0).max(1_000_000_000) })).max(60) }), req.body);
+  if (new Set(body.zones.map((z) => z.name.toLowerCase())).size !== body.zones.length) throw new HttpError(400, 'Each delivery area name must be different.');
+  await db.query("INSERT INTO settings (key, value) VALUES ('deliveryZones', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", [JSON.stringify(body.zones)]);
+  await audit(req.user.id, 'settings.delivery', 'deliveryZones', { count: body.zones.length });
+  res.json({ zones: body.zones });
+});
+
+/** Sellers whose balance is negative because of cash-on-delivery platform fees. */
+router.get('/cod-balances', async (req, res) => {
+  const { rows } = await db.query(`SELECT u.id, u.name, u.email, u.phone, sum(w.amount_minor) AS balance FROM wallet_entries w JOIN users u ON u.id = w.user_id
+                                   GROUP BY u.id HAVING sum(w.amount_minor) < 0 ORDER BY sum(w.amount_minor)`);
+  res.json({ sellers: rows.map((r) => ({ id: r.id, name: r.name, email: r.email, phone: r.phone, owedMinor: -r.balance })) });
+});
+
+/** Record that a seller paid their platform fees (cash, mobile money...). Positive amounts reduce what they owe. */
+router.post('/users/:id/wallet-adjustment', async (req, res) => {
+  if (!/^[0-9a-f-]{36}$/.test(req.params.id)) throw new HttpError(404, 'User not found.');
+  const body = parse(z.object({ amountMinor: z.coerce.number().int().refine((n) => n !== 0, 'Amount cannot be zero.'), note: z.string().trim().min(3).max(200) }), req.body);
+  const u = await db.query('SELECT id FROM users WHERE id = $1', [req.params.id]);
+  if (!u.rows[0]) throw new HttpError(404, 'User not found.');
+  await db.query("INSERT INTO wallet_entries (user_id, kind, amount_minor, note) VALUES ($1,'adjustment',$2,$3)", [req.params.id, body.amountMinor, body.note]);
+  await audit(req.user.id, 'wallet.adjustment', req.params.id, body);
+  res.json({ ok: true });
+});
+
 router.patch('/settings/commission', async (req, res) => {
   const { commissionPct } = parse(z.object({ commissionPct: z.coerce.number().min(0).max(50) }), req.body);
   await db.query("INSERT INTO settings (key, value) VALUES ('commissionPct', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", [JSON.stringify(commissionPct)]);

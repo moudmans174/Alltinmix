@@ -16,6 +16,7 @@ const schema = z.object({
   API_URL: z.string().default('http://localhost:4000'),
   TRUST_PROXY: z.string().default('0'),
   UPLOAD_DIR: z.string().default('./uploads'),
+  PRIVATE_DIR: z.string().default('./private'),
   AUTO_MIGRATE: bool(true),
   RATE_LIMIT: bool(true),
   REQUIRE_EMAIL_VERIFICATION: z.string().optional(),
@@ -50,6 +51,22 @@ const schema = z.object({
   PAYMENT_EXPIRY_MINUTES: z.coerce.number().default(30),
   ALLOW_DIGITAL_GOODS: bool(true),
   MIN_PAYOUT_MINOR: z.coerce.number().default(50000),
+
+  // Local delivery and payment
+  COD_ENABLED: bool(false),
+  COD_MAX_MINOR: z.coerce.number().default(0),
+  COD_SELLER_DEBT_LIMIT_MINOR: z.coerce.number().default(5000000),
+  DELIVERY_ZONES: z.string().default(''),
+  SMS_PROVIDER: z.enum(['none', 'twilio', 'webhook']).default('none'),
+  SMS_CHANNEL: z.enum(['sms', 'whatsapp']).default('sms'),
+  SMS_FROM: z.string().default(''),
+  TWILIO_ACCOUNT_SID: z.string().default(''),
+  TWILIO_AUTH_TOKEN: z.string().default(''),
+  SMS_WEBHOOK_URL: z.string().default(''),
+  SMS_WEBHOOK_TOKEN: z.string().default(''),
+  BOOST_PRICE_MINOR: z.coerce.number().default(0),
+  BOOST_DAYS: z.coerce.number().default(7),
+  PHONE_COUNTRY_CODE: z.string().regex(/^\d{0,4}$/, 'digits only, e.g. 232').default(''),
 });
 
 const parsed = schema.safeParse(process.env);
@@ -90,6 +107,7 @@ if (has('momo')) {
   ];
   for (const w of wallets) if (w.number) paymentMethods.push({ key: w.key, label: w.label, provider: 'momo', kind: 'manual', number: w.number, accountName: e.MOMO_ACCOUNT_NAME, currencies: listOf(e.MOMO_CURRENCIES, baseCode) });
 }
+if (e.COD_ENABLED) paymentMethods.push({ key: 'cod', label: 'Cash on delivery', provider: 'cod', kind: 'cod', currencies: [baseCode] });
 if (has('mock') && (!isProd || e.ALLOW_MOCK_PAYMENTS)) paymentMethods.push({ key: 'test', label: 'Test payment (no real money)', provider: 'mock', kind: 'redirect', currencies: offered });
 
 // A method only works in currencies the marketplace actually offers (base + FX_RATES). Drop methods with none, and say so.
@@ -121,6 +139,8 @@ if (isProd) {
     if (!v || placeholder.test(v)) problems.push(`${k} must be set to your real address (it is empty or still a placeholder).`);
   }
   if (/change-me/i.test(process.env.POSTGRES_PASSWORD || '')) problems.push('POSTGRES_PASSWORD is still the placeholder.');
+  if (e.SMS_PROVIDER === 'twilio' && !(e.TWILIO_ACCOUNT_SID && e.TWILIO_AUTH_TOKEN && e.SMS_FROM)) problems.push('Twilio needs TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN and SMS_FROM.');
+  if (e.SMS_PROVIDER === 'webhook' && !e.SMS_WEBHOOK_URL) problems.push('SMS_PROVIDER=webhook needs SMS_WEBHOOK_URL.');
   if (!e.SMTP_HOST) problems.push('SMTP_HOST is required so verification and order emails can be delivered.');
   if (problems.length) {
     console.error('Refusing to start in production:\n' + problems.map((p) => '  - ' + p).join('\n'));
@@ -145,6 +165,7 @@ module.exports = {
   apiUrl: e.API_URL.replace(/\/$/, ''),
   trustProxy: e.TRUST_PROXY === 'true' ? true : Number.isNaN(Number(e.TRUST_PROXY)) ? e.TRUST_PROXY : Number(e.TRUST_PROXY),
   uploadDir: e.UPLOAD_DIR,
+  privateDir: e.PRIVATE_DIR,
   autoMigrate: e.AUTO_MIGRATE,
   rateLimitEnabled: e.RATE_LIMIT && !isTest,
   requireEmailVerification: e.REQUIRE_EMAIL_VERIFICATION === undefined ? isProd : e.REQUIRE_EMAIL_VERIFICATION === 'true',
@@ -161,6 +182,14 @@ module.exports = {
   paymentExpiryMinutes: e.PAYMENT_EXPIRY_MINUTES,
   minPayoutMinor: e.MIN_PAYOUT_MINOR,
   allowDigital: e.ALLOW_DIGITAL_GOODS,
+  boost: { priceMinor: e.BOOST_PRICE_MINOR, days: e.BOOST_DAYS },
+  cod: { enabled: e.COD_ENABLED, maxMinor: e.COD_MAX_MINOR, sellerDebtLimitMinor: e.COD_SELLER_DEBT_LIMIT_MINOR },
+  deliveryZonesDefault: e.DELIVERY_ZONES.split(',').map((s) => s.trim()).filter(Boolean).map((s) => {
+    const i = s.lastIndexOf(':');
+    const fee = i > 0 ? Number(s.slice(i + 1)) : NaN;
+    return Number.isFinite(fee) && fee >= 0 ? { name: s.slice(0, i).trim(), feeMinor: Math.round(fee * 10 ** marketplace.currency.decimals) } : null;
+  }).filter(Boolean),
+  sms: { provider: e.SMS_PROVIDER, channel: e.SMS_CHANNEL, from: e.SMS_FROM, twilioSid: e.TWILIO_ACCOUNT_SID, twilioToken: e.TWILIO_AUTH_TOKEN, webhookUrl: e.SMS_WEBHOOK_URL, webhookToken: e.SMS_WEBHOOK_TOKEN, countryCode: e.PHONE_COUNTRY_CODE },
 
   baseCurrency: baseCode,
   currencies: marketplace.currencies,

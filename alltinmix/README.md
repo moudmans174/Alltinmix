@@ -150,10 +150,25 @@ docker-compose.yml, .env.example
 
 CLI (run from `backend/`): `npm run migrate`, `node src/cli.js create-admin <email> <name> <password>`.
 
-## 8. Safety features for app stores
+## 8. Local delivery, cash on delivery and alerts
+
+- **Delivery or pickup:** for physical items buyers choose delivery (area, address, phone) or pickup. Admin sets delivery areas and fees in Admin → Overview. The fee is charged once per seller and goes to the seller.
+- **Cash on delivery** (`COD_ENABLED=true`): only for carts of physical items, in the base currency. The order goes straight to the seller; no money is held. When the order completes, the platform fee is deducted from the seller's balance, which can go negative ("you owe"). Fees are offset by their future earnings, or the admin records a payment (Admin → Overview → sellers who owe). A seller who owes more than `COD_SELLER_DEBT_LIMIT_MINOR` stops receiving COD orders until they settle. COD has no escrow protection for the buyer, so keep `COD_MAX_MINOR` modest.
+- **Contact:** buyer and seller see each other's phone on the order with Call and WhatsApp buttons.
+- **SMS/WhatsApp alerts:** set `SMS_PROVIDER` (Twilio, or a webhook to any local gateway). Not tested against live providers here; test with your own account first.
+- **Low-data mode:** the lightning button in the header hides photos until tapped; on by default if the phone's Data Saver is on.
+
+## 8b. Buyer, trust and seller-growth features
+
+- **Buyers:** wishlist (heart), make an offer / counter-offer (48 h), order timeline, review photos, recently viewed.
+- **Trust:** sellers can submit an ID photo under *Seller > Grow*. It is stored in `PRIVATE_DIR` (never public), only admins can open it (*Admin > Seller ID*), and it is deleted when you approve or reject. Approved sellers get a **Verified** badge, a "Verified sellers only" filter, a public store page (`/store/:id`) with sales, rating and reply time, and there is a *Buyer protection* page (`/protection`).
+- **Sellers:** coupons (seller-funded, one use per buyer), promoted listings (paid from the seller's wallet; set `BOOST_PRICE_MINOR` above 0 to switch it on, `BOOST_DAYS` for the length), analytics (views, saves, sales, last 14 days) and CSV bulk upload (up to 100 rows).
+- Database changes arrive automatically as migrations 004 to 006 when the server starts.
+
+## 9. Safety features for app stores
 
 Users can report listings, people and messages and block other users; admins review reports in Admin → Reports (hide listing, suspend user, dismiss). Users can delete their own account in Account (refused while they have active orders or wallet money). `ALLOW_DIGITAL_GOODS=false` hides digital downloads. Terms and Privacy pages are at `/terms` and `/privacy`; have them reviewed for your country.
 
-## 9. Security notes
+## 10. Security notes
 
 Passwords are hashed with bcrypt; sessions are JWTs that are revoked instantly on suspend or password reset; email-verification and reset tokens are stored hashed; inputs are validated; uploads are type- and signature-checked; rate limits protect login, sign-up and messaging; webhook signatures are verified. Before launch, have the deployment reviewed (HTTPS, firewall, backups) and read the payment provider's own compliance requirements.

@@ -53,10 +53,10 @@ export const api = {
   patch: (p, body) => request(p, { method: 'PATCH', body }),
   del: (p) => request(p, { method: 'DELETE' }),
   request: (method, p, body) => request(p, { method, body }),
-  upload: (files) => {
+  upload: (files, path = '/uploads') => {
     const form = new FormData();
     [...files].forEach((f) => form.append('images', f));
-    return request('/uploads', { method: 'POST', form });
+    return request(path, { method: 'POST', form });
   },
 };
 

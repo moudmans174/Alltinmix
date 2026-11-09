@@ -21,11 +21,20 @@ ordersRouter.use(requireAuth);
 
 ordersRouter.post('/checkout', requireVerified, async (req, res) => {
   const body = parse(z.object({
-    items: z.array(z.object({ listingId: z.string().uuid(), qty: z.coerce.number().int().min(1).max(100).default(1) })).min(1, 'Your cart is empty.').max(30),
+    items: z.array(z.object({ listingId: z.string().uuid(), qty: z.coerce.number().int().min(1).max(100).default(1), offerId: z.string().uuid().optional() })).min(1, 'Your cart is empty.').max(30),
     method: z.string().min(1),
     currency: z.string().trim().length(3).optional(),
+    couponCode: z.string().trim().max(40).optional(),
+    delivery: z.object({
+      method: z.enum(['ship', 'pickup']),
+      zone: z.string().max(100).optional(),
+      name: z.string().max(100).optional(),
+      phone: z.string().max(40).optional(),
+      address: z.string().max(300).optional(),
+      note: z.string().max(300).optional(),
+    }).optional(),
   }), req.body);
-  res.status(201).json(await orders.checkout(req.user, body.items, body.method, body.currency));
+  res.status(201).json(await orders.checkout(req.user, body.items, body.method, body.currency, body.delivery, body.couponCode));
 });
 
 async function list(req, res, column, forSeller) {
@@ -42,6 +51,13 @@ async function list(req, res, column, forSeller) {
 }
 ordersRouter.get('/mine', (req, res) => list(req, res, 'buyer_id', false));
 ordersRouter.get('/selling', (req, res) => list(req, res, 'seller_id', true));
+
+ordersRouter.get('/:id/events', async (req, res) => {
+  const { rows: o } = await db.query('SELECT buyer_id, seller_id FROM orders WHERE id = $1', [req.params.id]);
+  if (!o[0] || (o[0].buyer_id !== req.user.id && o[0].seller_id !== req.user.id && req.user.role !== 'admin')) throw new HttpError(404, 'Order not found.');
+  const { rows } = await db.query('SELECT status, created_at FROM order_events WHERE order_id = $1 ORDER BY id', [req.params.id]);
+  res.json({ events: rows.map((r) => ({ status: r.status, at: r.created_at })) });
+});
 
 ordersRouter.get('/:id', async (req, res) => {
   if (!/^[0-9a-f-]{36}$/.test(req.params.id)) throw new HttpError(404, 'Order not found.');
@@ -60,7 +76,7 @@ for (const action of ['accept', 'deliver', 'confirm', 'cancel', 'dispute']) {
 }
 
 ordersRouter.post('/:id/review', async (req, res) => {
-  const body = parse(z.object({ rating: z.coerce.number().int().min(1).max(5), comment: z.string().trim().max(1000).default('') }), req.body);
+  const body = parse(z.object({ rating: z.coerce.number().int().min(1).max(5), comment: z.string().trim().max(1000).default(''), images: z.array(z.string().regex(/^\/uploads\/[a-f0-9-]{36}\.(jpg|png|webp)$/, 'Invalid image.')).max(3).default([]) }), req.body);
   res.status(201).json(await orders.createReview(req.user, req.params.id, body));
 });
 
