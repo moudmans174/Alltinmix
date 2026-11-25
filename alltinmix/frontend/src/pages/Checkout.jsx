@@ -22,6 +22,27 @@ export function Cart() {
   const zones = deliveryCfg?.zones || [];
   const [dv, setDv] = useState({ method: 'ship', zone: '', name: user?.name || '', phone: user?.phone || '', address: '', note: '' });
   const setD = (k) => (e) => setDv((d) => ({ ...d, [k]: e.target.value }));
+  const [saved, setSaved] = useState([]);
+  const [pickedAddr, setPickedAddr] = useState('');
+  const [saveAddr, setSaveAddr] = useState(true);
+  useEffect(() => {
+    if (!user) return;
+    api.get('/account/addresses').then((d) => {
+      setSaved(d.addresses);
+      const def = d.addresses.find((a) => a.isDefault);
+      if (def) useAddress(def);
+    }).catch(() => {});
+  }, [user?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+  function useAddress(a) {
+    setPickedAddr(a.id);
+    setDv((d) => ({ ...d, method: 'ship', name: a.name, phone: a.phone, address: a.address, zone: a.zone && zones.some((z) => z.name === a.zone) ? a.zone : d.zone }));
+  }
+  const slowest = physical.reduce((m, i) => Math.max(m, i.listing.shippingDays || 3), 0);
+  const eta = (() => {
+    if (!physical.length) return '';
+    const f = (n) => new Date(Date.now() + n * 86400000).toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric', month: 'short' });
+    return dv.method === 'pickup' ? `Ready for pickup by ${f(2)}` : `Estimated delivery: ${f(slowest)} to ${f(slowest + 2)}`;
+  })();
   const sellerCount = new Set(physical.map((i) => i.listing.sellerId || i.listing.sellerName)).size;
   const zone = zones.find((z) => z.name === dv.zone);
   const feeBase = physical.length && dv.method === 'ship' && zone ? zone.feeMinor * sellerCount : 0;
@@ -42,8 +63,11 @@ export function Cart() {
       const body = { items: items.map((i) => ({ listingId: i.listingId, qty: i.qty, ...(i.offerId ? { offerId: i.offerId } : {}) })), method, currency: payCode, ...(coupon.trim() ? { couponCode: coupon.trim() } : {}) };
       if (physical.length) body.delivery = dv.method === 'pickup' ? { method: 'pickup', name: dv.name, phone: dv.phone, note: dv.note } : { ...dv, zone: dv.zone || undefined };
       const d = await api.post('/orders/checkout', body);
+      if (physical.length && dv.method === 'ship' && saveAddr && !pickedAddr && dv.address.trim().length >= 5 && dv.phone.trim().length >= 5) {
+        api.post('/account/addresses', { name: dv.name, phone: dv.phone, zone: dv.zone || null, address: dv.address, label: '' }).catch(() => {});
+      }
       clear();
-      if (d.kind === 'cod') { toast('Order placed. Pay in cash when it arrives.'); nav('/orders'); return; }
+      if (d.kind === 'cod') { toast('Order placed. Pay in cash when it arrives.'); nav(`/pay/return/${d.paymentId}`); return; }
       if (/^https?:\/\//.test(d.redirectUrl)) { // card / PayPal hosted page (an in-app browser inside the phone app)
         await openPayment(d.redirectUrl, () => nav(`/pay/return/${d.paymentId}`));
         setBusy(false);
@@ -86,16 +110,24 @@ export function Cart() {
                     <button type="button" className={`chip ${dv.method === 'ship' ? 'on' : ''}`} onClick={() => setDv({ ...dv, method: 'ship' })}>Delivery</button>
                     <button type="button" className={`chip ${dv.method === 'pickup' ? 'on' : ''}`} onClick={() => setDv({ ...dv, method: 'pickup' })}>Pickup</button>
                   </div>
+                  {saved.length > 0 && dv.method === 'ship' && (
+                    <div className="chips" aria-label="Saved addresses">
+                      {saved.map((a) => <button type="button" key={a.id} className={`chip ${pickedAddr === a.id ? 'on' : ''}`} onClick={() => useAddress(a)}>{a.label || a.address.slice(0, 22)}{a.isDefault ? ' ★' : ''}</button>)}
+                      <button type="button" className={`chip ${pickedAddr === '' ? 'on' : ''}`} onClick={() => { setPickedAddr(''); setDv((d) => ({ ...d, address: '' })); }}>+ New address</button>
+                    </div>
+                  )}
                   <Field label="Your name"><input value={dv.name} onChange={setD('name')} autoComplete="name" /></Field>
                   <Field label="Phone number the seller can call"><input value={dv.phone} onChange={setD('phone')} inputMode="tel" autoComplete="tel" placeholder="+232 …" /></Field>
                   {dv.method === 'ship' ? (
                     <>
                       {zones.length > 0 && <Field label="Delivery area"><select value={dv.zone} onChange={setD('zone')}><option value="">Choose your area…</option>{zones.map((z) => <option key={z.name} value={z.name}>{z.name} ({formatIn(convert(z.feeMinor, payCode), payCode)})</option>)}</select></Field>}
-                      <Field label="Address"><textarea value={dv.address} onChange={setD('address')} placeholder="Street, landmark, house number" /></Field>
+                      <Field label="Address"><textarea value={dv.address} onChange={(e) => { setPickedAddr(''); setD('address')(e); }} placeholder="Street, landmark, house number" /></Field>
+                      {!pickedAddr && <label className="small" style={{ display: 'flex', gap: 8, alignItems: 'center' }}><input type="checkbox" checked={saveAddr} onChange={(e) => setSaveAddr(e.target.checked)} /> Save this address for next time</label>}
                       {sellerCount > 1 && zones.length > 0 && <p className="muted small">Your cart has items from {sellerCount} sellers, so the delivery fee is charged once per seller.</p>}
                     </>
                   ) : <p className="muted small">You collect it from the seller. They will contact you with the exact place and time{physical.length === 1 && physical[0].listing.location ? ` (listed location: ${physical[0].listing.location})` : ''}.</p>}
                   <Field label="Note for the seller (optional)"><input value={dv.note} onChange={setD('note')} maxLength={300} /></Field>
+                  {eta && <p className="small" style={{ margin: 0 }}>🚚 <b>{eta}</b> <span className="muted">(estimate, from when the seller accepts)</span></p>}
                 </div>
               )}
               <div>
@@ -111,7 +143,7 @@ export function Cart() {
                 {methods.map((m) => (
                   <label key={m.key} className={`method ${method === m.key ? 'on' : ''}`}>
                     <input type="radio" name="method" checked={method === m.key} onChange={() => setMethod(m.key)} />
-                    <span><b>{m.label}</b>{m.kind === 'manual' && <span className="muted small"><br />Send from your phone, then enter the transaction ID</span>}{m.kind === 'cod' && <span className="muted small"><br />Pay the seller in cash when you receive it</span>}</span>
+                    <span><b>{m.label}</b>{m.kind === 'manual' && <span className="muted small"><br />Send from your phone, then enter the transaction ID</span>}{m.kind === 'cod' && <span className="muted small"><br />Pay the seller in cash when you receive it</span>}{m.key === 'monime' && <span className="muted small"><br />Pay on Monime's secure page. Confirmed instantly</span>}</span>
                   </label>
                 ))}
               </div>
@@ -131,16 +163,23 @@ export function Cart() {
 export function PayReturn() {
   const { id } = useParams();
   const { user, ready } = useAuth();
+  const { formatIn } = useConfig();
   const [payment, setPayment] = useState(null);
+  const [orders, setOrders] = useState([]);
   const [error, setError] = useState('');
   const tries = useRef(0);
 
   const check = useCallback(async () => {
     if (!user) return 'anonymous';
     try {
-      const d = await api.post(`/payments/${id}/verify`);
-      setPayment(d.payment);
-      return d.payment.status;
+      const first = await api.get(`/payments/${id}`);
+      let pay = first.payment; let ords = first.orders;
+      if (pay.status !== 'cod') {
+        pay = (await api.post(`/payments/${id}/verify`)).payment;
+        if (pay.status === 'paid') ords = (await api.get(`/payments/${id}`)).orders;
+      }
+      setPayment(pay); setOrders(ords || []);
+      return pay.status;
     } catch (e) { setError(e.message); return 'error'; }
   }, [id, user]);
 
@@ -161,10 +200,26 @@ export function PayReturn() {
   if (error) return <div className="container page"><div className="card auth-box"><Alert>{error}</Alert><Link to="/orders" className="btn btn-primary">View my orders</Link></div></div>;
   if (!payment) return <Spinner />;
   const paid = payment.status === 'paid';
+  const cod = payment.status === 'cod';
   const failed = ['failed', 'refunded'].includes(payment.status);
   return (
     <div className="container page"><div className="card auth-box stack" style={{ textAlign: 'center' }}>
-      {paid ? <><h2>Payment received 🎉</h2><p>Your money is held safely until you confirm delivery.</p><Link to="/orders" className="btn btn-accent">Go to my orders</Link></>
+      {(paid || cod) ? <>
+        <h2>{cod ? 'Order placed 🎉' : 'Payment received 🎉'}</h2>
+        <p>{cod ? 'Pay the seller in cash only when the item is in your hands.' : 'Your money is held safely until you confirm delivery.'}</p>
+        <div style={{ textAlign: 'left' }} className="stack">
+          <p className="muted small" style={{ margin: 0 }}>Order reference <b>{payment.id.slice(0, 8).toUpperCase()}</b> · a {cod ? 'confirmation' : 'receipt'} has been emailed to {user.email}</p>
+          {orders.map((o) => (
+            <div key={o.id} className="card" style={{ padding: 12 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}><b>{o.title} × {o.qty}</b><span>{formatIn(o.totalMinor)}</span></div>
+              {o.expected && <div className="small">🚚 {o.deliveryMethod === 'pickup' ? '' : 'Expected '}<b>{o.expected}</b></div>}
+              {o.address && <div className="muted small">{o.deliveryMethod === 'pickup' ? `Pickup: ${o.address.pickupLocation || 'the seller will contact you'}` : `To: ${[o.address.name, o.address.address, o.zone].filter(Boolean).join(', ')}`}</div>}
+              {o.couponCode && <div className="muted small">Coupon {o.couponCode} saved you {formatIn(o.discountMinor)}</div>}
+            </div>
+          ))}
+          <div style={{ display: 'flex', justifyContent: 'space-between' }}><b>{cod ? 'To pay on delivery' : 'Total paid'}</b><b>{formatIn(payment.amountMinor, payment.currency)}</b></div>
+        </div>
+        <Link to="/orders" className="btn btn-accent">Track my order</Link><Link to="/browse" className="btn btn-ghost">Keep shopping</Link></>
         : failed ? <><h2>Payment didn't go through</h2><p className="muted">{payment.failureReason || 'You have not been charged.'}</p><Link to="/cart" className="btn btn-primary">Back to cart</Link></>
           : <><Spinner /><h3>Confirming your payment…</h3><p className="muted">This usually takes a few seconds. You can safely wait here.</p></>}
     </div></div>

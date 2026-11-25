@@ -21,7 +21,7 @@ const schema = z.object({
   RATE_LIMIT: bool(true),
   REQUIRE_EMAIL_VERIFICATION: z.string().optional(),
 
-  // Which payment systems are switched on: any of  stripe, flutterwave, paypal, momo, mock
+  // Which payment systems are switched on: any of  stripe, flutterwave, paypal, monime, momo, mock
   PAYMENT_PROVIDERS: z.string().default('mock'),
   CARD_PROVIDER: z.string().optional(), // stripe | flutterwave (defaults to whichever is enabled)
   ALLOW_MOCK_PAYMENTS: bool(false),
@@ -29,6 +29,11 @@ const schema = z.object({
   STRIPE_WEBHOOK_SECRET: z.string().optional(),
   FLW_SECRET_KEY: z.string().optional(),
   FLW_WEBHOOK_HASH: z.string().optional(),
+  MONIME_SPACE_ID: z.string().optional(),
+  MONIME_ACCESS_TOKEN: z.string().optional(),
+  MONIME_VERSION: z.enum(['caph.2025-08-23', 'caph.2025-06-20']).default('caph.2025-08-23'),
+  MONIME_AMOUNT_UNIT: z.enum(['minor', 'major']).default('minor'),
+  MONIME_CURRENCIES: z.string().optional(),
   PAYPAL_CLIENT_ID: z.string().optional(),
   PAYPAL_CLIENT_SECRET: z.string().optional(),
   PAYPAL_WEBHOOK_ID: z.string().optional(),
@@ -54,6 +59,7 @@ const schema = z.object({
 
   // Local delivery and payment
   COD_ENABLED: bool(false),
+  CLASSIFIED_CHECKOUT: bool(true), // vehicles and property get a "Buy now / pay securely" button next to "Message seller"
   COD_MAX_MINOR: z.coerce.number().default(0),
   COD_SELLER_DEBT_LIMIT_MINOR: z.coerce.number().default(5000000),
   DELIVERY_ZONES: z.string().default(''),
@@ -87,6 +93,7 @@ const offered = marketplace.currencies.map((c) => c.code);
 
 const stripeReady = !!(e.STRIPE_SECRET_KEY && e.STRIPE_WEBHOOK_SECRET);
 const flwReady = !!(e.FLW_SECRET_KEY && e.FLW_WEBHOOK_HASH);
+const monimeReady = !!(e.MONIME_SPACE_ID && e.MONIME_ACCESS_TOKEN);
 const paypalReady = !!(e.PAYPAL_CLIENT_ID && e.PAYPAL_CLIENT_SECRET);
 
 /**
@@ -99,6 +106,7 @@ const cardProvider = e.CARD_PROVIDER || (has('stripe') ? 'stripe' : has('flutter
 if (cardProvider === 'stripe' && has('stripe') && stripeReady) paymentMethods.push({ key: 'card', label: 'Credit / debit card', provider: 'stripe', kind: 'redirect', currencies: listOf(e.CARD_CURRENCIES, 'USD') });
 if (cardProvider === 'flutterwave' && has('flutterwave') && flwReady) paymentMethods.push({ key: 'card', label: 'Credit / debit card', provider: 'flutterwave', kind: 'redirect', currencies: listOf(e.CARD_CURRENCIES, 'USD') });
 if (has('paypal') && paypalReady) paymentMethods.push({ key: 'paypal', label: 'PayPal', provider: 'paypal', kind: 'redirect', currencies: listOf(e.PAYPAL_CURRENCIES, 'USD') });
+if (has('monime') && monimeReady) paymentMethods.push({ key: 'monime', label: 'Orange Money, Afrimoney or card (Monime)', provider: 'monime', kind: 'redirect', currencies: listOf(e.MONIME_CURRENCIES, baseCode) });
 if (has('momo')) {
   const wallets = [
     { key: 'orange_money', label: 'Orange Money', number: e.ORANGE_MONEY_NUMBER },
@@ -130,6 +138,8 @@ if (isProd) {
   if (has('mock') && !e.ALLOW_MOCK_PAYMENTS) problems.push('The "mock" provider moves no real money. Remove it from PAYMENT_PROVIDERS (or set ALLOW_MOCK_PAYMENTS=true for a demo).');
   if (has('stripe') && !stripeReady) problems.push('Stripe needs STRIPE_SECRET_KEY and STRIPE_WEBHOOK_SECRET.');
   if (has('flutterwave') && !flwReady) problems.push('Flutterwave needs FLW_SECRET_KEY and FLW_WEBHOOK_HASH.');
+  if (has('monime') && !monimeReady) problems.push('Monime needs MONIME_SPACE_ID and MONIME_ACCESS_TOKEN.');
+  if (has('monime') && e.MONIME_SPACE_ID && !/^spc-/.test(e.MONIME_SPACE_ID)) problems.push('MONIME_SPACE_ID should start with "spc-". Copy it from your Monime dashboard.');
   if (has('paypal') && !paypalReady) problems.push('PayPal needs PAYPAL_CLIENT_ID and PAYPAL_CLIENT_SECRET.');
   if (has('momo') && !(e.ORANGE_MONEY_NUMBER || e.AFRIMONEY_NUMBER || e.QMONEY_NUMBER)) problems.push('Mobile money needs at least one of ORANGE_MONEY_NUMBER, AFRIMONEY_NUMBER, QMONEY_NUMBER.');
   if (paymentMethods.length === 0) problems.push('No payment method is enabled. Set PAYMENT_PROVIDERS and the matching credentials.');
@@ -173,6 +183,7 @@ module.exports = {
   paymentMethods,
   stripe: { secretKey: e.STRIPE_SECRET_KEY, webhookSecret: e.STRIPE_WEBHOOK_SECRET },
   flutterwave: { secretKey: e.FLW_SECRET_KEY, webhookHash: e.FLW_WEBHOOK_HASH },
+  monime: { spaceId: e.MONIME_SPACE_ID, accessToken: e.MONIME_ACCESS_TOKEN, version: e.MONIME_VERSION, amountUnit: e.MONIME_AMOUNT_UNIT },
   paypal: { clientId: e.PAYPAL_CLIENT_ID, clientSecret: e.PAYPAL_CLIENT_SECRET, webhookId: e.PAYPAL_WEBHOOK_ID, env: e.PAYPAL_ENV },
 
   smtp: { host: e.SMTP_HOST, port: e.SMTP_PORT, secure: e.SMTP_SECURE, user: e.SMTP_USER, pass: e.SMTP_PASS },
@@ -183,6 +194,7 @@ module.exports = {
   minPayoutMinor: e.MIN_PAYOUT_MINOR,
   allowDigital: e.ALLOW_DIGITAL_GOODS,
   boost: { priceMinor: e.BOOST_PRICE_MINOR, days: e.BOOST_DAYS },
+  classifiedCheckout: e.CLASSIFIED_CHECKOUT,
   cod: { enabled: e.COD_ENABLED, maxMinor: e.COD_MAX_MINOR, sellerDebtLimitMinor: e.COD_SELLER_DEBT_LIMIT_MINOR },
   deliveryZonesDefault: e.DELIVERY_ZONES.split(',').map((s) => s.trim()).filter(Boolean).map((s) => {
     const i = s.lastIndexOf(':');

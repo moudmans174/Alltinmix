@@ -20,6 +20,7 @@ async function main() {
   const timers = [
     setInterval(safe('emails', () => processOutbox()), 10_000),
     setInterval(safe('sms', () => processSmsOutbox()), 10_000),
+    setInterval(safe('monime-poll', () => orders.pollProviderPayments()), 20_000),
     setInterval(safe('expire-payments', () => orders.expireStalePayments()), 60_000),
     setInterval(safe('offers', expireOffers), 10 * 60_000),
     setInterval(safe('auto-complete', () => orders.autoCompleteDelivered()), 10 * 60_000),

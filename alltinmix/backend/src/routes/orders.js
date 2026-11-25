@@ -6,6 +6,7 @@ const orders = require('../services/orders');
 const payments = require('../payments');
 const { HttpError, parse, paging } = require('../lib/util');
 const { requireAuth, requireVerified } = require('../lib/auth');
+const { paymentOrders } = require('../lib/receipt');
 
 const ordersRouter = express.Router();
 const paymentsRouter = express.Router();
@@ -90,7 +91,9 @@ paymentsRouter.get('/:id', async (req, res) => {
   const p = rows[0];
   if (!p || (p.buyer_id !== req.user.id && req.user.role !== 'admin')) throw new HttpError(404, 'Payment not found.');
   const method = config.paymentMethods.find((m) => m.key === p.method);
+  const ords = await paymentOrders(db, p.id);
   res.json({
+    orders: ords.map((o) => ({ id: o.id, title: o.title, qty: o.qty, totalMinor: o.total_minor, status: o.status, fulfillment: o.fulfillment, deliveryMethod: o.delivery_method, deliveryFeeMinor: o.delivery_fee_minor, discountMinor: o.discount_minor, couponCode: o.coupon_code, address: o.delivery_address, zone: o.delivery_zone, expected: o.expected, estimate: o.estimate })),
     payment: {
       id: p.id, method: p.method, methodLabel: method ? method.label : p.method, status: p.status, amountMinor: p.amount_minor, currency: p.currency, baseAmountMinor: p.base_amount_minor, fxRate: Number(p.fx_rate),
       failureReason: p.failure_reason, createdAt: p.created_at,
@@ -147,6 +150,19 @@ webhooksRouter.post('/flutterwave', express.json({ limit: '1mb' }), async (req, 
     return res.status(400).json({ error: 'Invalid signature' });
   }
   await orders.handleWebhook(event);
+  res.json({ received: true });
+});
+
+// Monime: the body is only used to find which payment to look at. handleWebhook re-checks it with Monime's API, so a
+// forged request cannot mark anything paid. We answer 200 so Monime does not keep retrying unknown events.
+webhooksRouter.post('/monime', express.json({ limit: '1mb' }), async (req, res) => {
+  if (!config.paymentMethods.some((m) => m.provider === 'monime')) return res.status(404).end();
+  try {
+    await orders.handleWebhook(payments.providerByName('monime').parseWebhook(req));
+  } catch (err) {
+    console.error('[monime webhook]', err.message);
+    return res.status(500).json({ error: 'Could not process the event' }); // Monime retries on a 5xx
+  }
   res.json({ received: true });
 });
 

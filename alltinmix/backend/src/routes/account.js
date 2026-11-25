@@ -29,6 +29,65 @@ router.patch('/profile', async (req, res) => {
   res.json({ user: publicUser(rows[0]) });
 });
 
+// Saved delivery addresses (max 10). The first one saved becomes the default.
+const addrSchema = z.object({
+  label: z.string().trim().max(40).default(''),
+  name: z.string().trim().min(2).max(80),
+  phone: z.string().trim().min(5).max(30),
+  zone: z.string().trim().max(80).optional().nullable(),
+  address: z.string().trim().min(5).max(300),
+  isDefault: z.boolean().optional(),
+});
+const addrApi = (a) => ({ id: a.id, label: a.label, name: a.name, phone: a.phone, zone: a.zone, address: a.address, isDefault: a.is_default });
+
+router.get('/addresses', async (req, res) => {
+  const { rows } = await db.query('SELECT * FROM addresses WHERE user_id = $1 ORDER BY is_default DESC, created_at DESC', [req.user.id]);
+  res.json({ addresses: rows.map(addrApi) });
+});
+
+router.post('/addresses', async (req, res) => {
+  const b = parse(addrSchema, req.body);
+  const out = await db.tx(async (c) => {
+    const { rows: ex } = await c.query('SELECT * FROM addresses WHERE user_id = $1 FOR UPDATE', [req.user.id]);
+    // Saving the same address twice just returns the existing one.
+    const dup = ex.find((a) => a.address.toLowerCase() === b.address.toLowerCase() && a.phone === b.phone);
+    if (dup) return dup;
+    if (ex.length >= 10) throw new HttpError(400, 'You can save up to 10 addresses. Delete one first.');
+    const makeDefault = b.isDefault || ex.length === 0;
+    if (makeDefault) await c.query('UPDATE addresses SET is_default = false WHERE user_id = $1', [req.user.id]);
+    const { rows } = await c.query(
+      'INSERT INTO addresses (user_id, label, name, phone, zone, address, is_default) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *',
+      [req.user.id, b.label, b.name, b.phone, b.zone || null, b.address, makeDefault]);
+    return rows[0];
+  });
+  res.status(201).json({ address: addrApi(out) });
+});
+
+router.patch('/addresses/:id', async (req, res) => {
+  if (!/^[0-9a-f-]{36}$/.test(req.params.id)) throw new HttpError(404, 'Address not found.');
+  const b = parse(addrSchema.partial(), req.body);
+  const out = await db.tx(async (c) => {
+    const { rows: ex } = await c.query('SELECT * FROM addresses WHERE id = $1 AND user_id = $2 FOR UPDATE', [req.params.id, req.user.id]);
+    if (!ex[0]) throw new HttpError(404, 'Address not found.');
+    if (b.isDefault) await c.query('UPDATE addresses SET is_default = false WHERE user_id = $1', [req.user.id]);
+    const { rows } = await c.query(
+      `UPDATE addresses SET label = COALESCE($3,label), name = COALESCE($4,name), phone = COALESCE($5,phone), zone = COALESCE($6,zone),
+         address = COALESCE($7,address), is_default = COALESCE($8,is_default) WHERE id = $1 AND user_id = $2 RETURNING *`,
+      [req.params.id, req.user.id, b.label ?? null, b.name ?? null, b.phone ?? null, b.zone ?? null, b.address ?? null, b.isDefault ?? null]);
+    return rows[0];
+  });
+  res.json({ address: addrApi(out) });
+});
+
+router.delete('/addresses/:id', async (req, res) => {
+  if (!/^[0-9a-f-]{36}$/.test(req.params.id)) throw new HttpError(404, 'Address not found.');
+  const { rows } = await db.query('DELETE FROM addresses WHERE id = $1 AND user_id = $2 RETURNING is_default', [req.params.id, req.user.id]);
+  if (!rows[0]) throw new HttpError(404, 'Address not found.');
+  // If the default was removed, promote the newest remaining one.
+  if (rows[0].is_default) await db.query('UPDATE addresses SET is_default = true WHERE id = (SELECT id FROM addresses WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1)', [req.user.id]);
+  res.json({ ok: true });
+});
+
 async function walletSummary(userId, q = db) {
   const { rows } = await q.query(
     `SELECT

@@ -69,6 +69,7 @@ const providers = {
   stripe: require('./stripe'),
   flutterwave: require('./flutterwave'),
   paypal: require('./paypal'),
+  monime: require('./monime'),
 };
 
 /** A payment method the buyer can currently choose (must be enabled in config). */

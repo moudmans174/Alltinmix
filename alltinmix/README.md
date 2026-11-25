@@ -124,6 +124,18 @@ Each payment method lists the currencies it accepts, which decides what buyers s
 
 So a buyer paying in dollars is offered card and PayPal, and a buyer paying in Leones is offered mobile money. Seller earnings, wallets, withdrawals and commission always stay in Leones; refunds go back in the currency the buyer paid. Check with your card provider which currencies your account can charge before going live. To use other currencies, add them to `FX_RATES` (supported: SLE, USD, EUR, GBP).
 
+### Monime setup
+
+Monime gives buyers one secure page for Orange Money, Afrimoney and cards, and confirms payments automatically (no admin checking needed).
+
+1. In your Monime dashboard, copy your **Space ID** (starts with `spc-`) and create an **access token**.
+2. In `backend/.env` add: `PAYMENT_PROVIDERS=monime,...`, `MONIME_SPACE_ID=...`, `MONIME_ACCESS_TOKEN=...`.
+3. Run `node src/cli.js monime-check` in `backend/`. It tests your keys and prints the webhook address.
+4. In Monime, add that webhook address (`https://YOUR-API/api/webhooks/monime`) if your dashboard offers webhooks. It is optional: the server also asks Monime about pending payments every 20 seconds and when the buyer returns to the site.
+5. **Before going live**, pay a real **Le 1** order and check that Monime shows Le 1 (not Le 100). If it is wrong, set `MONIME_AMOUNT_UNIT=major` and restart.
+
+Safety: a payment is only marked paid after our server asks Monime's API and gets "completed", so a fake webhook cannot release an order. Monime refunds are done by hand in your Monime dashboard and recorded under Admin > Refunds due.
+
 ## 5. Logo
 
 Put the logo file in `frontend/public/` as `logo.png` (or `.svg`, `.webp`) and set `BRAND_LOGO_URL=/logo.png` in `backend/.env`, then restart the backend. It appears in the header, as the browser tab icon, and in emails. It is shown as a round badge next to the name (set `BRAND_SHOW_NAME=false` if the logo already contains the name). If a logo disappears on the dark header, set `BRAND_LOGO_PLATE=true` to put it on a white badge. A wide logo about 400 px wide works best.
@@ -172,3 +184,18 @@ Users can report listings, people and messages and block other users; admins rev
 ## 10. Security notes
 
 Passwords are hashed with bcrypt; sessions are JWTs that are revoked instantly on suspend or password reset; email-verification and reset tokens are stored hashed; inputs are validated; uploads are type- and signature-checked; rate limits protect login, sign-up and messaging; webhook signatures are verified. Before launch, have the deployment reviewed (HTTPS, firewall, backups) and read the payment provider's own compliance requirements.
+
+## Backups and restore
+
+**On a server (Docker):** `docker compose up -d` also starts a `backup` service. It saves the database and the uploaded files (photos, seller ID documents) into the `backups` volume right away and then every `BACKUP_EVERY_HOURS` (24 by default), and deletes copies older than `BACKUP_KEEP_DAYS` (14).
+
+- List backups: `docker compose exec backup ls -lh /backups`
+- Run one now: `docker compose exec backup sh /ops/backup.sh`
+- Copy one to your computer: `docker compose cp backup:/backups/<file> .`
+- **A backup on the same server is lost if the server is lost.** Set `BACKUP_OFFSITE_CMD` in `.env` to copy them elsewhere after each run (for example `rclone copy /backups remote:alltinmix-backups`), or download them regularly.
+- Restore the database (replaces current data, asks you to type YES): stop the backend (`docker compose stop backend`), then `docker compose exec backup sh -c 'sh /ops/restore.sh /backups/<db-file>.sql.gz'`, then `docker compose start backend`.
+- Restore photos: `tar -xzf uploads-<stamp>.tar.gz -C /data` (and the same for `private-…`) into the uploads volume.
+- **Test a restore once before launch**, into an empty test database, so you know it works when you need it.
+
+**On your Windows computer (development):** run this in PowerShell, using your own password and Postgres version folder:
+`& "C:\Program Files\PostgreSQL\17\bin\pg_dump.exe" -U postgres -d tally -f C:\dev\alltinmix-backup.sql`

@@ -9,7 +9,10 @@ process.env.DATABASE_URL = process.env.TEST_DATABASE_URL || process.env.DATABASE
 process.env.UPLOAD_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'tally-uploads-'));
 process.env.PRIVATE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'tally-private-'));
 process.env.REQUIRE_EMAIL_VERIFICATION = 'true';
-process.env.PAYMENT_PROVIDERS = 'mock,momo,paypal,stripe';
+process.env.PAYMENT_PROVIDERS = 'mock,momo,paypal,stripe,monime';
+process.env.MONIME_SPACE_ID = 'spc-test';
+process.env.MONIME_ACCESS_TOKEN = 'tok_test';
+process.env.MONIME_CURRENCIES = 'USD';
 process.env.COD_ENABLED = 'true';
 process.env.DELIVERY_ZONES = 'Central:20,East:30';
 process.env.STRIPE_SECRET_KEY = 'sk_test_dummy';
@@ -122,7 +125,7 @@ describe('ALLTINMIX marketplace API', () => {
     assert.equal(r.status, 200);
     assert.deepEqual(r.body.verticals.map((v) => v.key), ['product', 'service', 'property', 'vehicle']);
     const keys = r.body.paymentMethods.map((m) => m.key).sort();
-    assert.deepEqual(keys, ['afrimoney', 'card', 'cod', 'orange_money', 'paypal', 'qmoney', 'test']);
+    assert.deepEqual(keys, ['afrimoney', 'card', 'cod', 'monime', 'orange_money', 'paypal', 'qmoney', 'test']);
     assert.equal(r.body.delivery.codEnabled, true);
     assert.deepEqual(r.body.delivery.zones, [{ name: 'Central', feeMinor: 2000 }, { name: 'East', feeMinor: 3000 }]);
     assert.ok(!JSON.stringify(r.body).includes('sk_test_dummy'), 'no secrets in public config');
@@ -262,9 +265,22 @@ describe('ALLTINMIX marketplace API', () => {
 
   test('real estate and vehicles are inquiry-only: no checkout, but buyers can message sellers', async () => {
     const house = (await api('get', '/api/listings?type=property')).body.listings[0];
+    const cfgC = require('../src/config');
+    cfgC.classifiedCheckout = false;
     const c = await api('post', '/api/orders/checkout', buyer.token, { items: [{ listingId: house.id, qty: 1 }], method: 'test' });
+    cfgC.classifiedCheckout = true;
     assert.equal(c.status, 400);
     assert.equal(c.body.code, 'INQUIRY_ONLY');
+    assert.equal((await api('get', `/api/listings/${house.id}`)).body.listing.buyOnline, true);
+    // With "pay now" on, a vehicle or house can be bought once, with the money held like any other order.
+    const buy = await api('post', '/api/orders/checkout', buyer.token, { items: [{ listingId: house.id, qty: 5 }], method: 'test' });
+    assert.equal(buy.status, 201, JSON.stringify(buy.body));
+    const ord = (await db.query('SELECT qty, status FROM orders WHERE payment_id = $1', [buy.body.paymentId])).rows[0];
+    assert.equal(ord.qty, 1);
+    assert.equal((await api('post', '/api/orders/checkout', buyer2.token, { items: [{ listingId: house.id, qty: 1 }], method: 'test' })).body.code, 'OUT_OF_STOCK');
+    await orders.failPayment(buy.body.paymentId, 'test');
+    assert.equal((await api('post', '/api/orders/checkout', buyer2.token, { items: [{ listingId: house.id, qty: 1 }], method: 'test' })).status, 201, 'released again after an unpaid checkout');
+    await orders.failPayment((await db.query("SELECT id FROM payments WHERE buyer_id = $1 AND status = 'pending'", [buyer2.id])).rows[0].id, 'test');
 
     assert.equal((await api('post', '/api/conversations', seller.token, { listingId: house.id, message: 'hi me' })).status, 400, 'cannot message yourself');
     const start = await api('post', '/api/conversations', buyer.token, { listingId: house.id, message: 'Is it still available? Can I visit Saturday?' });
@@ -770,6 +786,30 @@ describe('ALLTINMIX marketplace API', () => {
     assert.equal(o.delivery_address.address, '12 Main Street, Wellington');
     assert.equal((await db.query('SELECT stock FROM listings WHERE id = $1', [l.id])).rows[0].stock, 8);
 
+    // Confirmation page data, emailed receipt and delivery estimate
+    assert.match(ship.body.redirectUrl, /^\/pay\/return\//);
+    const conf = await api('get', `/api/payments/${ship.body.paymentId}`, buyr.token);
+    assert.equal(conf.body.orders.length, 1);
+    assert.equal(conf.body.orders[0].title, o.title);
+    assert.ok(conf.body.orders[0].expected, 'has a delivery window');
+    await new Promise((r) => setTimeout(r, 300));
+    const mail = (await db.query("SELECT subject, html FROM email_outbox WHERE subject LIKE 'Order placed:%' ORDER BY id DESC LIMIT 1")).rows[0];
+    assert.ok(mail && mail.html.includes('12 Main Street'), 'order confirmation email queued');
+
+    // Saved addresses
+    const a1 = await api('post', '/api/account/addresses', buyr.token, { label: 'Home', name: 'Cash Buyer', phone: '+23277000222', zone: 'East', address: '12 Main Street, Wellington' });
+    assert.equal(a1.status, 201);
+    assert.equal(a1.body.address.isDefault, true, 'first address is the default');
+    const dup = await api('post', '/api/account/addresses', buyr.token, { name: 'Cash Buyer', phone: '+23277000222', address: '12 main street, wellington' });
+    assert.equal(dup.body.address.id, a1.body.address.id, 'same address is not saved twice');
+    const a2 = await api('post', '/api/account/addresses', buyr.token, { label: 'Work', name: 'Cash Buyer', phone: '+23277000333', address: '5 Siaka Stevens Street', isDefault: true });
+    const list = await api('get', '/api/account/addresses', buyr.token);
+    assert.equal(list.body.addresses.length, 2);
+    assert.equal(list.body.addresses[0].id, a2.body.address.id, 'new default comes first');
+    assert.equal((await api('delete', `/api/account/addresses/${a2.body.address.id}`, sel.token)).status, 404, 'cannot delete someone else\'s address');
+    await api('delete', `/api/account/addresses/${a2.body.address.id}`, buyr.token);
+    assert.equal((await api('get', '/api/account/addresses', buyr.token)).body.addresses[0].isDefault, true, 'default is promoted after delete');
+
     // Seller sees where to deliver; the buyer sees the seller's contact
     const sOrders = await api('get', '/api/orders/selling', sel.token);
     assert.equal(sOrders.body.orders[0].deliveryAddress.phone, '+23277000222');
@@ -1013,5 +1053,93 @@ describe('ALLTINMIX marketplace API', () => {
     assert.equal(sp.description, 'Loud "one"');
     assert.equal((await api('post', '/api/seller/listings/bulk', sel.token, { csv: 'title\nx' })).body.code, 'BAD_CSV');
     assert.equal((await api('post', '/api/seller/listings/bulk', buyr.token, { csv })).status, 403);
+  });
+  test('Monime: hosted checkout, API-verified payment, forged webhook ignored, background check', async () => {
+    const sel = await register('seller', 'Mona Seller');
+    const buyr = await register('buyer', 'Moe Buyer');
+    const l = await mkListing(sel.token, { title: 'Monime Lamp', price: 50, stock: 5 });
+    assert.ok((await api('get', '/api/config')).body.paymentMethods?.some?.((m) => m.key === 'monime') ?? true);
+
+    // Fake Monime API: remember sessions, and let the test decide which ones are "paid".
+    const sessions = new Map();
+    const realFetch = global.fetch;
+    const calls = [];
+    global.fetch = async (url, opts = {}) => {
+      if (!String(url).startsWith('https://api.monime.io')) return realFetch(url, opts);
+      const u = new URL(url); const h = opts.headers || {};
+      calls.push({ path: u.pathname, method: opts.method || 'GET', h });
+      if (h.Authorization !== 'Bearer tok_test' || h['Monime-Space-Id'] !== 'spc-test') return new Response(JSON.stringify({ success: false, error: { message: 'unauthorized' } }), { status: 401 });
+      if (u.pathname === '/v1/checkout-sessions' && opts.method === 'POST') {
+        const b = JSON.parse(opts.body);
+        const id = 'sps-' + Math.random().toString(36).slice(2, 10);
+        sessions.set(id, { id, status: 'pending', reference: b.reference, lineItems: { data: [{ price: b.lineItems[0].price, quantity: 1 }] }, redirectUrl: `https://checkout.monime.io/${id}` });
+        return new Response(JSON.stringify({ success: true, result: sessions.get(id) }), { status: 200 });
+      }
+      const m = u.pathname.match(/^\/v1\/checkout-sessions\/(.+)$/);
+      if (m && sessions.has(m[1])) return new Response(JSON.stringify({ success: true, result: sessions.get(m[1]) }), { status: 200 });
+      return new Response(JSON.stringify({ success: false }), { status: 404 });
+    };
+    try {
+      const start = async () => {
+        const r = await api('post', '/api/orders/checkout', buyr.token, { items: [{ listingId: l.id, qty: 1 }], method: 'monime' });
+        assert.equal(r.status, 201, JSON.stringify(r.body));
+        return r.body;
+      };
+      const pay = await start();
+      assert.match(pay.redirectUrl, /^https:\/\/checkout\.monime\.io\/sps-/);
+      const created = calls.find((c) => c.method === 'POST');
+      assert.equal(created.h['Idempotency-Key'], pay.paymentId);
+      const row = (await db.query('SELECT * FROM payments WHERE id = $1', [pay.paymentId])).rows[0];
+      assert.equal(row.provider, 'monime');
+      const sess = sessions.get(row.provider_ref);
+      assert.equal(sess.lineItems.data[0].price.value, 5000); // $50.00 in minor units
+      assert.equal(sess.reference, pay.paymentId);
+
+      // A forged webhook for an unpaid session changes nothing (Monime says it is still pending).
+      let w = await request(app).post('/api/webhooks/monime').send({ event: 'checkout_session.completed', data: { id: row.provider_ref, reference: pay.paymentId } });
+      assert.equal(w.status, 200);
+      assert.equal((await db.query('SELECT status FROM payments WHERE id = $1', [pay.paymentId])).rows[0].status, 'pending');
+      // Garbage bodies are harmless.
+      assert.equal((await request(app).post('/api/webhooks/monime').send({ hello: 'world' })).status, 200);
+
+      // Buyer pays; the real webhook arrives and the API confirms it.
+      sess.status = 'completed';
+      w = await request(app).post('/api/webhooks/monime').send({ event: 'checkout_session.completed', data: { id: row.provider_ref, reference: pay.paymentId } });
+      assert.equal(w.status, 200);
+      assert.equal((await db.query('SELECT status FROM payments WHERE id = $1', [pay.paymentId])).rows[0].status, 'paid');
+      assert.equal((await db.query('SELECT status FROM orders WHERE payment_id = $1', [pay.paymentId])).rows[0].status, 'pending_acceptance');
+      // Same webhook twice is safe.
+      assert.equal((await request(app).post('/api/webhooks/monime').send({ data: { id: row.provider_ref } })).status, 200);
+
+      // Missed webhook: the background check and the return page both catch it.
+      const pay2 = await start();
+      const ref2 = (await db.query('SELECT provider_ref FROM payments WHERE id = $1', [pay2.paymentId])).rows[0].provider_ref;
+      sessions.get(ref2).status = 'completed';
+      await db.query("UPDATE payments SET created_at = now() - interval '1 minute' WHERE id = $1", [pay2.paymentId]);
+      assert.ok((await orders.pollProviderPayments()) >= 1);
+      assert.equal((await db.query('SELECT status FROM payments WHERE id = $1', [pay2.paymentId])).rows[0].status, 'paid');
+
+      const pay3 = await start();
+      const ref3 = (await db.query('SELECT provider_ref FROM payments WHERE id = $1', [pay3.paymentId])).rows[0].provider_ref;
+      sessions.get(ref3).status = 'completed';
+      assert.equal((await api('post', `/api/payments/${pay3.paymentId}/verify`, buyr.token)).body.payment.status, 'paid');
+
+      // If Monime ever reports a different amount than we asked for, we do not release the order.
+      const pay4 = await start();
+      const ref4 = (await db.query('SELECT provider_ref FROM payments WHERE id = $1', [pay4.paymentId])).rows[0].provider_ref;
+      Object.assign(sessions.get(ref4), { status: 'completed' });
+      sessions.get(ref4).lineItems.data[0].price.value = 100;
+      assert.equal((await api('post', `/api/payments/${pay4.paymentId}/verify`, buyr.token)).body.payment.status, 'pending');
+
+      // Expired session fails the payment and frees the stock.
+      const pay5 = await start();
+      const ref5 = (await db.query('SELECT provider_ref FROM payments WHERE id = $1', [pay5.paymentId])).rows[0].provider_ref;
+      sessions.get(ref5).status = 'expired';
+      assert.equal((await api('post', `/api/payments/${pay5.paymentId}/verify`, buyr.token)).body.payment.status, 'failed');
+
+      // Monime refunds are manual: flagged for the admin.
+      const prov = require('../src/payments').providerByName('monime');
+      assert.equal((await prov.refund()).manual, true);
+    } finally { global.fetch = realFetch; }
   });
 });

@@ -13,3 +13,9 @@ frontend/ios/App/Pods/
 frontend/ios/App/build/
 *.keystore
 *.jks
+
+# update bundles and backups must never be committed
+*.zip
+backups/
+*.sql
+*.sql.gz

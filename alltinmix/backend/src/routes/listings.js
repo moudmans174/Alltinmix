@@ -2,6 +2,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const express = require('express');
+const { estimateFor, windowText } = require('../lib/estimate');
 const multer = require('multer');
 const { z } = require('zod');
 const db = require('../db');
@@ -23,6 +24,7 @@ function toApi(r, { priv = false } = {}) {
     sellerTag: r.seller_tag,
     type: r.type,
     mode: vertical ? vertical.mode : 'checkout',
+    buyOnline: !!(vertical && vertical.mode === 'inquiry' && vertical.commerce === 'classified' && config.classifiedCheckout),
     category: r.category,
     title: r.title,
     description: r.description,
@@ -36,6 +38,7 @@ function toApi(r, { priv = false } = {}) {
     fulfillment: r.fulfillment,
     stock: r.stock,
     shippingDays: r.shipping_days,
+    estimate: (() => { const e = estimateFor({ type: r.type, fulfillment: r.fulfillment, commerce: config.verticalOf(r.type)?.commerce, deliveryMethod: 'ship', shippingDays: r.shipping_days, deliveryDays: r.delivery_days }); return e ? { ...e, text: windowText(e) } : null; })(),
     ratingAvg: Number(r.rating_avg),
     ratingCount: r.rating_count,
     soldCount: r.sold_count,

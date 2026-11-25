@@ -27,6 +27,20 @@ services:
       TRUST_PROXY: "2"   # nginx in the frontend container + your HTTPS proxy in front of it
     volumes: [uploads:/data/uploads, private:/data/private]
 
+  # Daily backups of the database and uploaded files into the "backups" volume (kept BACKUP_KEEP_DAYS days).
+  backup:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    depends_on:
+      db: { condition: service_healthy }
+    environment:
+      DATABASE_URL: postgres://alltinmix:${POSTGRES_PASSWORD}@db:5432/alltinmix
+      KEEP_DAYS: ${BACKUP_KEEP_DAYS:-14}
+      BACKUP_EVERY_HOURS: ${BACKUP_EVERY_HOURS:-24}
+      OFFSITE_CMD: ${BACKUP_OFFSITE_CMD:-}
+    command: ["sh", "/ops/backup-loop.sh"]
+    volumes: [backups:/backups, uploads:/data/uploads:ro, private:/data/private:ro, ./ops:/ops:ro]
+
   frontend:
     build: ./frontend
     restart: unless-stopped
@@ -34,6 +48,7 @@ services:
     ports: ["${WEB_PORT:-8080}:80"]
 
 volumes:
+  backups:
   pgdata:
   private:
   uploads:

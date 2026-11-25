@@ -98,11 +98,14 @@ async function checkout(user, rawItems, methodKey, currencyCode, deliveryInput, 
       const l = rows[0];
       if (!l || l.status !== 'active') throw new HttpError(409, 'One of the items in your cart is no longer available.', { code: 'UNAVAILABLE' });
       const vertical = config.verticalOf(l.type);
-      if (!vertical || vertical.mode !== 'checkout') throw new HttpError(400, `"${l.title}" can't be bought online. Please message the seller instead.`, { code: 'INQUIRY_ONLY' });
+      const classifiedBuy = !!(vertical && vertical.mode === 'inquiry' && vertical.commerce === 'classified' && config.classifiedCheckout);
+      if (!vertical || (vertical.mode !== 'checkout' && !classifiedBuy)) throw new HttpError(400, `"${l.title}" can't be bought online. Please message the seller instead.`, { code: 'INQUIRY_ONLY' });
       if (l.seller_id === user.id) throw new HttpError(400, "You can't buy your own listing.");
 
       const digital = l.fulfillment === 'digital';
-      let qty = vertical.commerce === 'service' || digital ? 1 : line.qty;
+      // A vehicle or property is a single item: the first paid checkout reserves it.
+      if (classifiedBuy && l.stock === null) { await c.query('UPDATE listings SET stock = 1 WHERE id = $1', [l.id]); l.stock = 1; }
+      let qty = vertical.commerce === 'service' || vertical.commerce === 'classified' || digital ? 1 : line.qty;
       let unit = l.price_minor;
       if (line.offerId) {
         // A negotiated price: valid only for the buyer, for the agreed quantity, until it expires, and only once.
@@ -184,7 +187,10 @@ async function checkout(user, rawItems, methodKey, currencyCode, deliveryInput, 
     return { paymentId, total, payAmount, titles: orders.map((o) => o.listing.title) };
   });
 
-  if (isCod) return { paymentId: created.paymentId, method: method.key, kind: 'cod', redirectUrl: '/orders', totalMinor: created.total, payAmountMinor: created.payAmount, payCurrency: payCode };
+  if (isCod) {
+    require('../lib/receipt').sendReceipt(created.paymentId);
+    return { paymentId: created.paymentId, method: method.key, kind: 'cod', redirectUrl: `/pay/return/${created.paymentId}`, totalMinor: created.total, payAmountMinor: created.payAmount, payCurrency: payCode };
+  }
 
   // The provider call happens outside the transaction (it is a slow network request).
   const description = created.titles.length === 1 ? created.titles[0] : `${created.titles.length} items from ${config.marketplace.brand.name}`;
@@ -246,6 +252,8 @@ async function markPaymentPaid(paymentId, { providerTxnId } = {}) {
     return { already: false, lateOrderIds };
   });
 
+  if (!outcome.already) require('../lib/receipt').sendReceipt(paymentId);
+
   for (const id of outcome.lateOrderIds) {
     await db.tx(async (c) => {
       const { rows } = await c.query('SELECT * FROM orders WHERE id = $1 FOR UPDATE', [id]);
@@ -299,7 +307,10 @@ async function verifyPayment(paymentId, user) {
 async function handleWebhook(event) {
   if (!event) return;
   let p;
-  if (event.paymentId) p = (await db.query('SELECT * FROM payments WHERE id = $1', [event.paymentId])).rows[0];
+  if (event.candidates) {
+    // The provider's payload carried ids we have to match ourselves (Monime). Only our own, still-open payments count.
+    p = (await db.query("SELECT * FROM payments WHERE (id::text = ANY($1) OR provider_ref = ANY($1)) AND provider = ANY($2) LIMIT 1", [event.candidates, ['monime']])).rows[0];
+  } else if (event.paymentId) p = (await db.query('SELECT * FROM payments WHERE id = $1', [event.paymentId])).rows[0];
   else if (event.providerRef) p = (await db.query('SELECT * FROM payments WHERE provider_ref = $1', [event.providerRef])).rows[0];
   if (!p) return;
   if (event.status === 'paid') {
@@ -505,6 +516,21 @@ async function expireStalePayments() {
   return n;
 }
 
+/** Check pending Monime payments with Monime itself. Orders complete even if the webhook never arrives. */
+async function pollProviderPayments() {
+  if (!config.paymentMethods.some((m) => m.provider === 'monime')) return 0;
+  const { rows } = await db.query("SELECT * FROM payments WHERE provider = 'monime' AND status IN ('pending','failed') AND created_at > now() - interval '3 days' AND created_at < now() - interval '20 seconds' ORDER BY created_at DESC LIMIT 25");
+  let n = 0;
+  for (const p of rows) {
+    try {
+      const r = await payments.providerByName('monime').verify(p);
+      if (r.status === 'paid') { await markPaymentPaid(p.id, { providerTxnId: r.providerTxnId }); n++; }
+      else if (r.status === 'failed' && p.status === 'pending') await failPayment(p.id, 'The payment was not completed.');
+    } catch (err) { console.error('[monime poll]', p.id, err.message); }
+  }
+  return n;
+}
+
 /** Complete delivered orders the buyer never confirmed, so sellers always get paid. */
 async function autoCompleteDelivered() {
   const { rows } = await db.query("SELECT id FROM orders WHERE status = 'delivered' AND delivered_at < now() - make_interval(days => $1)", [config.autoCompleteDays]);
@@ -585,5 +611,5 @@ module.exports = {
   getCommissionPct, getRates, getDeliveryZones, convertMinor, moneyIn, checkout, markPaymentPaid, failPayment, verifyPayment, handleWebhook,
   submitManualProof, confirmManualPayment, rejectManualPayment,
   transition, resolveDispute, createReview, getOrder,
-  expireStalePayments, autoCompleteDelivered, ORDER_SELECT, orderToApi, money,
+  expireStalePayments, pollProviderPayments, autoCompleteDelivered, ORDER_SELECT, orderToApi, money,
 };

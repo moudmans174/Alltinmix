@@ -32,6 +32,12 @@ export function ListingCard({ l }) {
   const { lowData } = useTheme();
   const v = vertical(l.type);
   const summary = attributeSummary(l, v, 3);
+  const cart = useCart();
+  const { user } = useAuth();
+  const nav = useNavigate();
+  const toast = useToast();
+  const buyable = (l.mode !== 'inquiry' || l.buyOnline) && l.stock !== 0 && !(user && user.id === l.sellerId);
+  const go = (e, buyNow) => { e.preventDefault(); e.stopPropagation(); cart.add(l, 1); if (buyNow) nav('/cart'); else toast('Added to your cart.'); };
   return (
     <Link to={`/listing/${l.id}`} className="listing-card">
       <div className="thumb">
@@ -49,6 +55,12 @@ export function ListingCard({ l }) {
           {l.location && <><MapPin size={12} />{l.location}</>}
           {l.ratingCount > 0 && <span className="row" style={{ gap: 3, marginLeft: 'auto' }}><Star size={12} fill="#f59e0b" stroke="#f59e0b" />{l.ratingAvg.toFixed(1)} ({l.ratingCount})</span>}
         </span>
+        {buyable && (
+          <span className="row" style={{ gap: 6, marginTop: 8 }}>
+            <button type="button" className="btn btn-accent btn-sm" style={{ flex: 1 }} onClick={(e) => go(e, true)}>{v?.commerce === 'service' ? 'Order' : 'Buy'}</button>
+            <button type="button" className="btn btn-ghost btn-sm" style={{ flex: 1 }} onClick={(e) => go(e, false)}>Add to cart</button>
+          </span>
+        )}
       </div>
     </Link>
   );
@@ -231,12 +243,21 @@ export function ListingDetail() {
           <div className="price" style={{ fontSize: '1.9rem' }}>{formatMoney(l.priceMinor)}</div>
           <p className="muted small" style={{ margin: 0 }}>Sold by <Link to={`/store/${l.sellerId}`}><b>{l.sellerName}</b></Link> {l.sellerVerified && <VerifiedBadge />}{l.sellerTag ? ` · ${l.sellerTag}` : ''}{l.location ? ` · ${l.location}` : ''}</p>
           <p className="muted small" style={{ margin: 0 }}><Link to="/protection">Buyer protection</Link> · money held until you confirm</p>
+          {l.mode === 'inquiry' && l.buyOnline && !isOwner && !soldOut && (
+            <div className="stack">
+              <button className="btn btn-accent btn-block" onClick={() => { cart.add(l, 1); nav('/cart'); }}>Buy now · pay securely</button>
+              <button className="btn btn-ghost btn-block" onClick={() => { cart.add(l, 1); toast('Added to your cart.'); }}>Add to cart</button>
+              <p className="muted small" style={{ margin: 0 }}>Your money is held until you confirm the handover. Prefer to talk first? Message the seller below.</p>
+            </div>
+          )}
+          {l.mode === 'inquiry' && soldOut && <p className="pill pill-grey" style={{ alignSelf: 'flex-start' }}>Reserved / sold</p>}
           {l.mode === 'inquiry' ? <InquiryBox listing={l} /> : isOwner ? (
             <div className="stack"><p className="muted">This is your listing.</p><Link className="btn btn-ghost btn-block" to={`/seller/listings/${l.id}/edit`}>Edit listing</Link></div>
           ) : (
             <>
               <ul className="muted small" style={{ paddingLeft: 18, margin: 0 }}>
                 {v?.commerce === 'service' && <li>Delivered in about {l.deliveryDays} day{l.deliveryDays === 1 ? '' : 's'} after the seller accepts</li>}
+                {l.estimate && l.estimate.kind === 'ship' && <li>🚚 Estimated delivery: <b>{l.estimate.text}</b></li>}
                 {v?.commerce === 'product' && !digital && <li>Ships in about {l.shippingDays} day{l.shippingDays === 1 ? '' : 's'}{l.stock !== null ? ` · ${l.stock} in stock` : ''}</li>}
                 {digital && <li>Instant digital download after payment</li>}
                 <li>Money is held until you confirm you're happy</li>

@@ -2,6 +2,7 @@
  * Command line tools:
  *   npm run migrate                                  apply database migrations
  *   npm run create-admin -- you@x.com "Your Name" "a-strong-password"
+ *   node src/cli.js monime-check                     test your Monime credentials
  */
 const config = require('./config');
 const db = require('./db');
@@ -31,8 +32,15 @@ async function main() {
   } else if (cmd === 'create-admin') {
     await db.migrate();
     await createAdmin(...args);
+  } else if (cmd === 'monime-check') {
+    if (!config.monime.spaceId || !config.monime.accessToken) throw new Error('Set MONIME_SPACE_ID and MONIME_ACCESS_TOKEN in your .env first.');
+    const { monime } = require('./payments/monime');
+    const list = await monime('/v1/checkout-sessions?limit=1');
+    console.log('Monime credentials work. Space:', config.monime.spaceId, '| API version:', config.monime.version, '| sessions visible:', Array.isArray(list) ? list.length : 'ok');
+    console.log('Webhook address to give Monime:', `${config.apiUrl}/api/webhooks/monime`);
+    console.log('Offered at checkout:', config.paymentMethods.some((m) => m.provider === 'monime') ? 'yes (add "monime" to PAYMENT_PROVIDERS if not)' : 'NO. Add "monime" to PAYMENT_PROVIDERS.');
   } else {
-    console.log('Commands: migrate | create-admin <email> <name> <password>');
+    console.log('Commands: migrate | create-admin <email> <name> <password> | monime-check');
     process.exitCode = 1;
   }
   await db.pool.end();

@@ -1,7 +1,8 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { Download, MapPin, MessageCircle, Phone, Store } from 'lucide-react';
 import { api, assetUrl, qs } from '../api';
-import { useConfig, useToast } from '../context';
+import { Link, useNavigate } from 'react-router-dom';
+import { useCart, useConfig, useToast } from '../context';
 import { Alert, Empty, Field, Receipt, Spinner, Stars, StatusPill } from '../components/ui';
 
 function Modal({ title, children, onClose }) {
@@ -124,6 +125,16 @@ function OrderCard({ o, seller, act }) {
   const btn = (action, label, cls = 'btn-primary', confirmText) => (
     <button className={`btn btn-sm ${cls}`} disabled={!!busy} onClick={() => run(action, confirmText)}>{busy === action ? '…' : label}</button>
   );
+  const cart = useCart();
+  const nav = useNavigate();
+  const toast = useToast();
+  const buyAgain = async () => {
+    try {
+      const d = await api.get(`/listings/${o.listingId}`);
+      if (d.listing.stock === 0) return toast('Sorry, this item is out of stock right now.');
+      cart.add(d.listing, o.qty); toast('Added to your cart.'); nav('/cart');
+    } catch { toast('This item is no longer available.'); }
+  };
   const digital = o.fulfillment === 'digital';
   return (
     <div className="order">
@@ -148,6 +159,7 @@ function OrderCard({ o, seller, act }) {
         {!seller && o.status === 'pending_acceptance' && btn('cancel', 'Cancel order', 'btn-ghost', 'Cancel this order and get a refund?')}
         {!seller && o.status === 'delivered' && <>{btn('confirm', 'Confirm — all good', 'btn-accent', 'Release the payment to the seller? You can’t undo this.')}<button className="btn btn-ghost btn-sm" onClick={() => setModal('dispute')}>Report a problem</button></>}
         {!seller && o.status === 'in_progress' && <button className="btn btn-ghost btn-sm" onClick={() => setModal('dispute')}>Report a problem</button>}
+        {!seller && o.listingId && ['completed', 'delivered', 'cancelled', 'refunded'].includes(o.status) && o.type !== 'property' && o.type !== 'vehicle' && <button className="btn btn-ghost btn-sm" onClick={buyAgain}>Buy it again</button>}
         {!seller && o.status === 'completed' && !o.reviewed && <button className="btn btn-primary btn-sm" onClick={() => setModal('review')}>Leave a review</button>}
       </div>
       {modal === 'dispute' && <DisputeModal order={o} onClose={() => setModal(null)} onDone={(m) => { setModal(null); act(o.id, null, m); }} />}

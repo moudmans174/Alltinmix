@@ -173,6 +173,46 @@ function DeleteAccount() {
   );
 }
 
+function SavedAddresses() {
+  const toast = useToast();
+  const [list, setList] = useState(null);
+  const [f, setF] = useState({ label: '', name: '', phone: '', address: '' });
+  const [err, setErr] = useState('');
+  const load = () => api.get('/account/addresses').then((d) => setList(d.addresses)).catch((e) => setErr(e.message));
+  useEffect(() => { load(); }, []);
+  const add = async (e) => {
+    e.preventDefault(); setErr('');
+    try { await api.post('/account/addresses', f); setF({ label: '', name: '', phone: '', address: '' }); toast('Address saved.'); load(); } catch (x) { setErr(x.message); }
+  };
+  const act = (fn) => async () => { try { await fn(); load(); } catch (x) { setErr(x.message); } };
+  return (
+    <div className="card stack">
+      <h2>Saved addresses</h2>
+      <Alert>{err}</Alert>
+      {list && list.length === 0 && <p className="muted small">No saved addresses yet. Add one and checkout gets faster.</p>}
+      {(list || []).map((a) => (
+        <div key={a.id} className="card" style={{ padding: 12 }}>
+          <b>{a.label || 'Address'}{a.isDefault ? ' · default' : ''}</b>
+          <div className="small">{a.name} · {a.phone}</div>
+          <div className="muted small">{a.address}{a.zone ? `, ${a.zone}` : ''}</div>
+          <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+            {!a.isDefault && <button type="button" className="btn btn-ghost btn-sm" onClick={act(() => api.patch(`/account/addresses/${a.id}`, { isDefault: true }))}>Make default</button>}
+            <button type="button" className="btn btn-ghost btn-sm" onClick={act(() => api.del(`/account/addresses/${a.id}`))}>Delete</button>
+          </div>
+        </div>
+      ))}
+      <form onSubmit={add} className="stack">
+        <h3>Add an address</h3>
+        <Field label="Label (Home, Work…)"><input value={f.label} maxLength={40} onChange={(e) => setF({ ...f, label: e.target.value })} /></Field>
+        <Field label="Name"><input required value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} /></Field>
+        <Field label="Phone"><input required value={f.phone} onChange={(e) => setF({ ...f, phone: e.target.value })} /></Field>
+        <Field label="Address"><textarea required value={f.address} onChange={(e) => setF({ ...f, address: e.target.value })} placeholder="Street, landmark, house number" /></Field>
+        <button className="btn btn-primary">Save address</button>
+      </form>
+    </div>
+  );
+}
+
 export function Account() {
   const { user, setUser } = useAuth();
   const { payoutMethods } = useConfig();
@@ -220,6 +260,7 @@ export function Account() {
         <Field label="New password" error={pw.fields.newPassword}><input type="password" autoComplete="new-password" required {...pw.bind('newPassword')} /></Field>
         <button className="btn btn-primary" disabled={pw.busy}>Update password</button>
       </form>
+      <SavedAddresses />
       <BlockedUsers />
       <DeleteAccount />
     </div></div>
